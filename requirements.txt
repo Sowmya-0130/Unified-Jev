@@ -1,0 +1,15 @@
+sqlalchemy
+azure-search-documents
+python-dotenv
+pyautogen==0.2.35
+pandas
+tiktoken
+graphrag==0.3.6
+lancedb
+openai
+pyarrow
+duckdb
+numpy
+scipy
+aiohttp
+tqdm
