@@ -2,18 +2,50 @@
 
 | ID | Title | Sev | Status | Root cause | Evidence | Fix | Verify |
 |----|-------|-----|--------|------------|----------|-----|--------|
-| I-01 | Azure OpenAI auth at first LLM call | P0 | **BLOCKED-ON-HUMAN (KEY)** | Neither main nor graph key authenticates to the configured public endpoint | HTTP **401** (not 403) both keys; error `code` **401** “invalid subscription key or wrong API endpoint”; `apim-request-id` eb384dd9… (main), dbbd8447… (graph); DNS `cognitiveservices` → **20.61.99.32** (public Azure, not privatelink); `openai.azure.com` **NXDOMAIN** | Sowmya: valid Key1 for `aipractices` cognitive resource + deployment `gpt-5.4` (or correct name) | `python scripts/i01_http_probe.py` → HTTP 200 |
-| I-02 | JEV skip gates E2E never verified live | P1 | OPEN | Blocked by I-01 | `jev_smoke_trace.py` empty agent sequence | Unblock I-01 | live smoke vs mocks |
-| I-03 | S7/S9/S13 unified confidence | P2 | CLOSED | — | `tests/test_jev_gates.py` | `JEV_CONFIDENCE_THRESHOLD` | pytest |
-| I-04 | JEV flags at import time | P2 | CLOSED | `.env` once at startup (`override=False`) | `tests/test_i04_flags.py` | Streamlit reload | pytest |
-| I-05 | WinError 10054 asyncio noise | P3 | CLOSED | Subprocess regress runner uses separate processes; Streamlit uses default Proactor | `scripts/verify_loop.py` uses `subprocess` | `_call_connection_lost` ConnectionResetError filter in `main.py` | Streamlit reconnect |
-| I-06 | No automated JEV tests | P2 | CLOSED | — | `tests/test_jev_gates.py` | mocked gates | pytest |
-| I-07 | Per-request JEV trace | P2 | IN-PROGRESS | Wired; empty until pipeline runs | `jev_trace` in response | I-01 unblocked | smoke |
+| I-01 | Azure OpenAI auth at first LLM call | P0 | **BLOCKED-ON-HUMAN (ENDPOINT)** | Host/key mismatch: `aipractices.openai.azure.com` **NXDOMAIN**; keys rejected with explicit “wrong API endpoint” | HTTP **401** both keys (`scripts/i01_http_probe.py`); JSON `code` **401**; `aipractices.cognitiveservices.azure.com` → CNAME `20.61.99.32` (WE) but fake stem `aurix-nonexistent-zq7x91.cognitiveservices.azure.com` → **NXDOMAIN** (no wildcard) | Portal **Endpoint** + **Keys** from same OpenAI-capable resource; correct `*.openai.azure.com` or Portal host | `i01_http_probe.py` → 200 |
+| I-02 | JEV skip gates E2E never verified live | P1 | OPEN | Blocked by I-01 | smoke trace | Unblock I-01 | live smoke |
+| I-03 | S7/S9/S13 unified confidence | P2 | CLOSED | — | pytest | — | pytest |
+| I-04 | JEV flags at import time | P2 | CLOSED | — | pytest | — | pytest |
+| I-05 | WinError 10054 asyncio noise | P3 | CLOSED | — | `main.py` handler | — | Streamlit |
+| I-06 | No automated JEV tests | P2 | CLOSED | — | `test_jev_gates.py` | — | pytest |
+| I-07 | Per-request JEV trace | P2 | IN-PROGRESS | — | `jev_trace` | I-01 | smoke |
+| I-08 | DNS alias patch may hide wrong endpoint | P1 | OPEN | `install_openai_dns_alias_patch()` can resolve `*.openai.azure.com` via `*.cognitiveservices.azure.com` when stem exists in DNS | I-01: openai host NXDOMAIN but cognitiveservices stem resolves yet 401 “wrong API endpoint”; see `azure_openai_endpoint.py` | Warning logs on patch install + per alias; do not remove patch yet | Log lines on import |
 
-## Classification (I-01): **KEY**
+## I-01 classification: **ENDPOINT** (revised from KEY)
 
-Public DNS reaches West Europe cognitive endpoint (`20.61.99.32`); no private-endpoint pattern. Both **FrYB**** (len 84)** and **098a**** (len 32)** return the same **401** JSON — wrong/inactive keys for this resource, not network lockdown (would typically be **403**) and not deployment/api-version errors (would be **404**/**400**).
+**Reasoning**
 
-## Message for Sowmya (KEY case)
+1. **`aipractices.openai.azure.com` is NXDOMAIN** on public DNS — the usual Portal hostname for an Azure OpenAI resource is missing; we may be calling a **cognitiveservices** URL that is not the paired OpenAI endpoint for these keys.
+2. Azure’s error text says **“invalid subscription key or wrong API endpoint”** (HTTP **401**, not **403**) for **both** keys — consistent with **endpoint/resource name wrong**, deleted, or not OpenAI-capable, not only a bad key on the correct host.
+3. **Wildcard test (step 1):** `aurix-nonexistent-zq7x91.cognitiveservices.azure.com` → **NXDOMAIN** (does **not** hit the West Europe `20.61.99.32` gateway). So there is **no** public `*.cognitiveservices.azure.com` wildcard that explains `aipractices` — but **`aipractices.cognitiveservices.azure.com` resolving does NOT prove** the `aipractices` Cognitive/OpenAI resource is correct for our keys (resource-specific CNAME exists; still 401).
+4. **Not NETWORK** (no 403 / no privatelink pattern on this host). **Not DEPLOYMENT/API-VERSION** (would be 404/400, not this 401 body).
 
-> Hi Sowmya — for AURIX local dev against `https://aipractices.cognitiveservices.azure.com/` (deployment `gpt-5.4`, api-version `2024-12-01-preview`), both the main `AZURE_OPENAI_API_KEY` and `graph_api_key` return **HTTP 401** with `"code": "401", "message": "Access denied due to invalid subscription key or wrong API endpoint..."` (apim-request-id examples: `eb384dd9-7ab5-453f-a2f4-8869d84ddba6`). DNS resolves to public `20.61.99.32` (West Europe). Can you share the **active Key 1** for this Cognitive Services resource and confirm the exact **chat deployment name** we should use in `GPT4_LLM_MODEL_DEPLOYMENT_NAME`?
+## DNS evidence (2026-11-25)
+
+| Hostname | Result |
+|----------|--------|
+| `aurix-nonexistent-zq7x91.cognitiveservices.azure.com` | NXDOMAIN |
+| `aurix-nonexistent-zq7x91.openai.azure.com` | NXDOMAIN |
+| `aipractices.cognitiveservices.azure.com` | `20.61.99.32` (WE, resource-specific CNAME) |
+| `aipractices.openai.azure.com` | NXDOMAIN |
+| `aipractices.services.ai.azure.com` | NXDOMAIN |
+
+## Distinct Azure OpenAI endpoint hostnames (repo + git history, no keys)
+
+| Hostname | Source |
+|----------|--------|
+| `aipractices.cognitiveservices.azure.com` | `.env`, `docs/ARCHITECTURE_JEV.md` |
+| `aipractices.openai.azure.com` | `azure_openai_endpoint.py` candidate (NXDOMAIN) |
+| `aipractices.services.ai.azure.com` | `azure_openai_endpoint.py` candidate (NXDOMAIN) |
+| `placeholder.openai.azure.com` | `tests/test_i04_flags.py` / dev commit fixture (`20.232.91.180` East US) |
+| `placeholder.cognitiveservices.azure.com` | Azure doc placeholder (`20.208.144.211`) |
+| `YOUR-RESOURCE.cognitiveservices.azure.com` | `.env.example` template |
+| `<name>.openai.azure.com` | `azure_health.py` help text |
+| `cognitiveservices.azure.com` | DefaultAzureCredential scope in `aurix_core.py` (not a resource host) |
+| “east2 host” | `.env` comment only — no hostname in repo |
+
+**`*.openai.azure.com` nslookup:** only `placeholder.openai.azure.com` resolves publicly; `aipractices.openai.azure.com` does not — **no alternate live OpenAI hostname for `aipractices` in public DNS**.
+
+## Message for Sowmya (ENDPOINT case)
+
+> Hi Sowmya — `aipractices.openai.azure.com` does not exist in public DNS (NXDOMAIN), while `.env` uses `https://aipractices.cognitiveservices.azure.com/`. Both API keys return HTTP **401** with *"invalid subscription key or wrong API endpoint"*. Can you paste the **exact Endpoint URL from Azure Portal** (Keys and Endpoint) for the OpenAI resource we should use, confirm the resource still exists and has chat deployment **gpt-5.4** (or give the correct deployment name), and whether keys were issued for that same resource (not a different one)?
