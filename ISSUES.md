@@ -8,8 +8,16 @@
 | I-04 | JEV flags at import time | P2 | CLOSED | — | pytest | — | pytest |
 | I-05 | WinError 10054 asyncio noise | P3 | CLOSED | — | `main.py` handler | — | Streamlit |
 | I-06 | No automated JEV tests | P2 | CLOSED | — | `test_jev_gates.py` | — | pytest |
-| I-07 | Per-request JEV trace | P2 | IN-PROGRESS | — | `jev_trace` | I-01 | smoke |
+| I-07 | Per-request JEV trace | P2 | **CLOSED** | — | `jev_trace` gate events + latency block | `jev_trace.py` timeline | smoke |
 | I-08 | DNS alias patch may hide wrong endpoint | P1 | OPEN | `install_openai_dns_alias_patch()` can resolve `*.openai.azure.com` via `*.cognitiveservices.azure.com` when stem exists in DNS | I-01: openai host NXDOMAIN but cognitiveservices stem resolves yet 401 “wrong API endpoint”; see `azure_openai_endpoint.py` | Warning logs on patch install + per alias; do not remove patch yet | Log lines on import |
+| I-10 | `db_execute_query` HY000 vs `test_sql.py` OK | P0 | OPEN | Connection path / pool / MARS mismatch under Streamlit+AutoGen | Run log; `test_sql.py` OK | `scripts/sql_probe.py` + connection diff | probe + pytest |
+| I-11 | Sql_Generator stale schema | P0 | OPEN | Hardcoded/cached schema lists non-existent tables | `Updated_email_dupoint.Orders` in log | Dynamic INFORMATION_SCHEMA provider | schema tests |
+| I-12 | Hardcoded SQL error hints | P1 | OPEN | `aurix_core.db_execute_query` hint text | `grep Updated_email_dupoint` | Live-schema fuzzy hints | `git grep` clean |
+| I-13 | SQL nested retries, no fail-fast | P1 | OPEN | `read_sql` × ODBC retries × `run_sql_with_retry` | 8 attempts per tool call | Unified retry policy from `.env` | unit tests |
+| I-14 | Unbounded SQL repair loop | P1 | OPEN | No `SQL_MAX_REPAIR_ROUNDS` | ~108s, 3 repair rounds | Cap + user-facing last error | smoke |
+| I-15 | Query_Executor rewrites SQL / fan-out | P1 | OPEN | LLM rewrites Sql_Generator SQL | Parallel tool calls in log | Proposal: verbatim single execute | I-16 timeline |
+| I-16 | Per-step latency breakdown | P1 | **CLOSED** | No timeline on agent/tool/JEV steps | Long SQL runs opaque | `jev_trace` timeline + summary table | `test_jev_trace_timeline.py` |
+| I-17 | autogen model pricing warning | P2 | OPEN | Missing price in config_list | gpt-5-mini pricing 0 | `.env` MODEL_PRICE_* or silence | log clean |
 
 ## I-01 classification: **ENDPOINT** (revised from KEY)
 

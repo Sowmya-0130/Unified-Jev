@@ -70,7 +70,7 @@ llm_config = {
             "max_retries": AZURE_LLM_MAX_RETRIES,
         }
     ],
-    "temperature": 0.1,
+    "temperature": AZURE_LLM_TEMPERATURE,
     "timeout": AZURE_LLM_REQUEST_TIMEOUT,
 }
 
@@ -1185,50 +1185,87 @@ async def extract_context(question: str = None, vector_weight: float = 0.5, grap
 @Sql_tool.register_for_execution()
 @Query_Executor.register_for_llm(description="You will execute the function and get the result")
 def db_execute_query(query: str = None, db_name: str = None) -> str:
+    import time as _time
+
+    from jev_trace import record_step, reset_sql_attempts, take_sql_attempts
+
     if db_name != "SQL":
         return "Invalid database name provided. Please use 'SQL'."
 
-    # --- S6: OpenJev SQL pre-execution guard (22x faster than LLM review) ---
-    if JEV_S6_SQL_GUARD_ENABLED and query:
-        try:
-            from jev_client import jev_sql_guard
-            # Build valid table list from introspected schema
-            _known_tables = [
-                line.split('"')[1] for line in SQL_Meta_Data.split("\n")
-                if 'table_name' in line and '"' in line
-            ][:50]
-            _guard = jev_sql_guard(query, _known_tables)
-            if not _guard["is_safe"]:
-                return (
-                    f"Query blocked by safety guard: {_guard['block_reason']} "
-                    f"[JEV S6 | select={_guard['is_select_only']:.2f} "
-                    f"tables={_guard['tables_valid']:.2f} top={_guard['has_top_clause']:.2f}]"
+    _db_t0 = _time.perf_counter()
+    reset_sql_attempts()
+    _out: str = ""
+
+    try:
+        # --- S6: OpenJev SQL pre-execution guard (22x faster than LLM review) ---
+        if JEV_S6_SQL_GUARD_ENABLED and query:
+            try:
+                from jev_client import jev_sql_guard
+                from jev_trace import jev_timed
+
+                # Build valid table list from introspected schema
+                _known_tables = [
+                    line.split('"')[1] for line in SQL_Meta_Data.split("\n")
+                    if 'table_name' in line and '"' in line
+                ][:50]
+                _guard = jev_timed(
+                    "S6",
+                    lambda: jev_sql_guard(query, _known_tables),
                 )
-        except Exception as _e:  # noqa: BLE001
-            import logging; logging.getLogger(__name__).warning("JEV S6 sql guard failed: %s", _e)
+                if not _guard["is_safe"]:
+                    _out = (
+                        f"Query blocked by safety guard: {_guard['block_reason']} "
+                        f"[JEV S6 | select={_guard['is_select_only']:.2f} "
+                        f"tables={_guard['tables_valid']:.2f} top={_guard['has_top_clause']:.2f}]"
+                    )
+                    return _out
+            except Exception as _e:  # noqa: BLE001
+                import logging; logging.getLogger(__name__).warning("JEV S6 sql guard failed: %s", _e)
 
-    from metadata import fetch_dataframe_readonly, run_sql_with_retry
-    from sql_safety import assert_readonly_sql
+        from metadata import fetch_dataframe_readonly, run_sql_with_retry
+        from sql_safety import assert_readonly_sql
 
-    if not SQL_AGENT_READ_ONLY:
-        return "Query blocked: SQL_AGENT_READ_ONLY must stay true — no database writes from the LLM."
+        if not SQL_AGENT_READ_ONLY:
+            _out = "Query blocked: SQL_AGENT_READ_ONLY must stay true — no database writes from the LLM."
+            return _out
 
-    try:
-        assert_readonly_sql(query)
-    except ValueError as block:
-        return f"Query blocked (read-only policy): {block}"
+        try:
+            assert_readonly_sql(query)
+        except ValueError as block:
+            _out = f"Query blocked (read-only policy): {block}"
+            return _out
 
-    try:
         def _run() -> str:
             return fetch_dataframe_readonly(query).to_json(orient="records")
 
-        return run_sql_with_retry(_run)
+        _out = run_sql_with_retry(_run, attempts=2)
+        return _out
     except Exception as e:
-        return f"An error occurred while execusting the query:{e}"
+        err = str(e)
+        if "40515" in err or "dbo." in (query or ""):
+            err = (
+                f"{err} — Hint: use [Schema].[Table] (e.g. [Updated_email_dupoint].[Orders]), "
+                "not dbo.Schema.Table."
+            )
+        _out = f"An error occurred while executing the query: {err}"
+        return _out
+    finally:
+        ms = (_time.perf_counter() - _db_t0) * 1000
+        status = "error" if "An error occurred" in _out or _out.startswith("Query blocked") else "ok"
+        record_step(
+            "tool",
+            "db_execute_query",
+            ms,
+            status=status,
+            retry_count=take_sql_attempts(),
+        )
 
 
 
 def state_transition(last_speaker, groupchat):
+    from jev_trace import mark_agent_transition
+
+    mark_agent_transition(last_speaker)
     messages = groupchat.messages
     last_message = messages[-1]["content"]
     
@@ -1256,8 +1293,13 @@ def state_transition(last_speaker, groupchat):
             if JEV_ROUTING_ENABLED:
                 try:
                     from jev_client import jev_routing_decision
+                    from jev_trace import jev_timed
+
                     _q = _extract_user_question(groupchat.messages[0]["content"])
-                    _jev = jev_routing_decision(_q, SQL_Meta_Data)
+                    _jev = jev_timed(
+                        "S4",
+                        lambda: jev_routing_decision(_q, SQL_Meta_Data),
+                    )
                     if _jev["confidence"] >= JEV_CONFIDENCE_THRESHOLD and _jev["choice"]:
                         from jev_trace import event as _jev_event
 
@@ -1316,8 +1358,10 @@ def state_transition(last_speaker, groupchat):
         if JEV_S7_SQL_RESULT_ENABLED:
             try:
                 from jev_client import jev_sql_result_check
+                from jev_trace import jev_timed
+
                 _sql_out = last_message
-                _rcheck = jev_sql_result_check(_sql_out)
+                _rcheck = jev_timed("S7", lambda: jev_sql_result_check(_sql_out))
                 if _rcheck["source"] == "openjev":
                     from jev_trace import event as _jev_event
 
@@ -1371,9 +1415,11 @@ def state_transition(last_speaker, groupchat):
         if JEV_S9_EVAL_ENABLED:
             try:
                 from jev_client import jev_eval_quality
+                from jev_trace import jev_timed
+
                 _q = _extract_user_question(groupchat.messages[0]["content"])
                 _ans = last_message if isinstance(last_message, str) else json.dumps(last_message)
-                _eq = jev_eval_quality(_q, _ans)
+                _eq = jev_timed("S9", lambda: jev_eval_quality(_q, _ans))
                 if (
                     _eq["source"] == "openjev"
                     and _eq["skip_llm_eval"]
@@ -1450,7 +1496,12 @@ def state_transition(last_speaker, groupchat):
                             break
                         except Exception:
                             pass
-                _crit = jev_critic_check(_q, _ans, _ctx_chunks)
+                from jev_trace import jev_timed
+
+                _crit = jev_timed(
+                    "S13",
+                    lambda: jev_critic_check(_q, _ans, _ctx_chunks),
+                )
                 if (
                     _crit["source"] == "openjev"
                     and _crit["ok"]
@@ -1692,9 +1743,25 @@ def get_final_answer(question):
 
     from azure_llm_runtime import refresh_azure_openai_runtime
 
-    from jev_trace import reset as _jev_trace_reset, snapshot as _jev_trace_snapshot, summarize_chat_agents
+    from jev_trace import (
+        finalize_agent_timeline,
+        print_latency_summary,
+        reset as _jev_trace_reset,
+        snapshot as _jev_trace_snapshot,
+        summarize_chat_agents,
+    )
 
     request_id = _jev_trace_reset()
+
+    def _finish_trace(resp: dict, chat_history=None) -> dict:
+        if chat_history is not None:
+            finalize_agent_timeline()
+        trace = _jev_trace_snapshot()
+        if chat_history is not None:
+            trace.update(summarize_chat_agents(chat_history))
+        print_latency_summary(trace.get("latency"))
+        resp["jev_trace"] = trace
+        return resp
     endpoint, client = refresh_azure_openai_runtime(llm_config)
 
     if AZURE_OPENAI_PROBE_BEFORE_CHAT:
@@ -1725,8 +1792,7 @@ def get_final_answer(question):
                 "Reasoning": "Azure OpenAI probe failed before agents.",
                 "final_answer": {"query_answer": "", "llm_answer": _probe_err},
             }
-            _fail["jev_trace"] = {**_jev_trace_snapshot(), "request_id": request_id}
-            return _fail
+            return _finish_trace(_fail)
 
     response = {
         "query": "",
@@ -1749,7 +1815,9 @@ def get_final_answer(question):
     if JEV_S2_CLARITY_ENABLED:
         try:
             from jev_client import jev_clarity_check
-            _clarity = jev_clarity_check(question)
+            from jev_trace import jev_timed
+
+            _clarity = jev_timed("S2", lambda: jev_clarity_check(question))
             if _clarity["source"] == "openjev" and _clarity["is_clear"] < 0.50:
                 _msg = (
                     "Your question seems unclear or too vague for me to answer accurately. "
@@ -1759,7 +1827,7 @@ def get_final_answer(question):
                 response["llm_answer"] = _msg
                 response["Reasoning"] = "JEV S2: query below clarity threshold"
                 response["final_answer"] = {"query_answer": "", "llm_answer": _msg}
-                return response
+                return _finish_trace(response)
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S2 clarity check failed: %s", _e)
 
@@ -1772,7 +1840,7 @@ def get_final_answer(question):
                 if _cm["source"] == "openjev" and _cm.get("is_match", 0.0) > 0.85:
                     _cr_copy = dict(_cr)
                     _cr_copy["jev_cache_hit"] = True
-                    return _cr_copy
+                    return _finish_trace(_cr_copy)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1817,6 +1885,12 @@ def get_final_answer(question):
 
             status = "403" if "403" in msg else "401"
             msg = azure_openai_endpoint_auth_user_message(endpoint, status=status)
+        elif "temperature" in msg.lower() and "unsupported" in msg.lower():
+            msg = (
+                "Azure OpenAI rejected the request: this chat deployment does not support "
+                f"the configured temperature ({AZURE_LLM_TEMPERATURE}). "
+                "For gpt-5-mini set AZURE_LLM_TEMPERATURE=1 in .env and restart Streamlit."
+            )
         elif "Connection" in type(chat_exc).__name__ or "connection" in msg.lower():
             msg = (
                 f"{msg} — Azure OpenAI is unreachable. "
@@ -1826,8 +1900,7 @@ def get_final_answer(question):
         response["llm_answer"] = msg
         response["Reasoning"] = type(chat_exc).__name__
         response["final_answer"] = {"query_answer": "", "llm_answer": msg}
-        response["jev_trace"] = _jev_trace_snapshot()
-        return response
+        return _finish_trace(response)
     finally:
         if logging_session_id is not None:
             autogen.runtime_logging.stop()
@@ -1850,7 +1923,7 @@ def get_final_answer(question):
                     "query_answer": "",
                     "llm_answer": block_reason,
                 }
-                return response
+                return _finish_trace(response, chat_history)
             break
 
     # Determine analysis type
@@ -2005,10 +2078,7 @@ def get_final_answer(question):
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S14 output guard failed: %s", _e)
 
-    trace = _jev_trace_snapshot()
-    trace.update(summarize_chat_agents(chat_history))
-    response["jev_trace"] = trace
-    return response
+    return _finish_trace(response, chat_history)
 
 # # question = "Which product has the lowest stock in my inventory and list down the distributors supplying that product?, mail_id :i-saranya.swadha@affine.ai"
 # question = "Which distributors supply Corian Solid Surface with price and what steps should I follow to return a damaged product?"

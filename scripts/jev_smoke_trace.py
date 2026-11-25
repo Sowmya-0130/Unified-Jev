@@ -91,6 +91,8 @@ def run_case(label: str, question: str) -> None:
         skipped.append("routing_agent (possible S4 skip)")
     print("likely_skipped_llm_agents:", skipped or "(none detected)")
     trace = out.get("jev_trace") or {}
+    lat = trace.get("latency") or {}
+    print("latency_summary:", json.dumps(lat, indent=2, default=str)[:3000])
     print("jev_trace:", json.dumps(trace, indent=2, default=str)[:4000])
     print("final_answer keys:", list((out.get("final_answer") or {}).keys()))
 

@@ -53,24 +53,19 @@ def _build_odbc_str(*, read_only_intent: bool = False) -> str:
     return "".join(parts)
 
 
-def _pyodbc_connect(*, read_only_intent: bool = False):
-    """
-    Direct ODBC connect with retries.
-    After long AutoGen runs / LanceDB use, pooled handles on Windows often fail with HY000.
-    """
+def _pyodbc_connect(*, read_only_intent: bool = False, attempts: int = 1):
+    """Direct ODBC connect (single attempt by default — outer layers own retry loops)."""
     last_err: Exception | None = None
-    attempts = max(1, AZURE_SQL_ODBC_RETRIES)
-    for attempt in range(attempts):
+    tries = max(1, attempts)
+    for attempt in range(tries):
         try:
             with _odbc_lock:
                 return pyodbc.connect(_build_odbc_str(read_only_intent=read_only_intent))
         except pyodbc.Error as exc:
             last_err = exc
-            if attempt + 1 >= attempts:
-                _log.warning("ODBC connect attempt %s/%s failed: %s", attempt + 1, attempts, exc)
-            else:
-                _log.debug("ODBC connect attempt %s/%s failed: %s", attempt + 1, attempts, exc)
-            time.sleep(0.75 * (attempt + 1))
+            if tries > 1:
+                _log.warning("ODBC connect attempt %s/%s failed: %s", attempt + 1, tries, exc)
+                time.sleep(0.75 * (attempt + 1))
     assert last_err is not None
     raise last_err
 
@@ -103,26 +98,33 @@ def warm_odbc_connection() -> bool:
 
 
 def fetch_dataframe_readonly(sql: str):
-    """Run a validated SELECT via a fresh pyodbc connection (bypasses stale SQLAlchemy pool)."""
-    from sql_safety import assert_readonly_sql
+    """Run a validated SELECT (NullPool engine — same path as test_sql.py)."""
+    import pandas as pd
+    from sqlalchemy import text
+
+    from sql_safety import assert_readonly_sql, normalize_agent_sql_identifiers
 
     assert_readonly_sql(sql)
+    sql = normalize_agent_sql_identifiers(sql)
     last_err: Exception | None = None
     attempts = max(1, AZURE_SQL_ODBC_RETRIES)
     for attempt in range(attempts):
         try:
             with _odbc_lock:
-                conn = pyodbc.connect(_build_odbc_str(read_only_intent=True))
-                try:
-                    import pandas as pd
-
-                    return pd.read_sql(sql, conn)
-                finally:
-                    conn.close()
+                with engine.connect() as conn:
+                    return pd.read_sql(text(sql), conn)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            try:
+                from jev_trace import bump_sql_attempt
+
+                bump_sql_attempt()
+            except ImportError:
+                pass
             _log.warning("read_sql attempt %s failed: %s", attempt + 1, exc)
-            time.sleep(1.0 * (attempt + 1))
+            dispose_sql_engine()
+            if attempt + 1 < attempts:
+                time.sleep(1.0 * (attempt + 1))
     assert last_err is not None
     raise last_err
 
@@ -144,6 +146,12 @@ def run_sql_with_retry(operation: Callable[[], T], *, attempts: int | None = Non
             return operation()
         except Exception as exc:  # noqa: BLE001
             last_err = exc
+            try:
+                from jev_trace import bump_sql_attempt
+
+                bump_sql_attempt()
+            except ImportError:
+                pass
             _log.warning("SQL operation attempt %s/%s failed: %s", attempt + 1, tries, exc)
             if attempt + 1 < tries:
                 time.sleep(1.25 * (attempt + 1))
@@ -158,7 +166,11 @@ def get_schema_tables(engine, schema_name):
     schema_details = ""
     for table_name in tables:
         columns = inspector.get_columns(table_name, schema=schema_name)
-        schema = f'schema = "{schema_name}", table_name = "{schema_name}.{table_name}", {table_name}_table = Table(\n'
+        schema = (
+            f'schema = "{schema_name}", '
+            f'table_name = "[{schema_name}].[{table_name}]", '
+            f"{table_name}_table = Table(\n"
+        )
         for column in columns:
             col_name = column['name']
             col_type = column['type']
