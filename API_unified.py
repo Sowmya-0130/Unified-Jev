@@ -11,8 +11,11 @@ from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parent
 
-# Always load .env from the project root (works regardless of cwd)
-load_dotenv(dotenv_path=_ROOT / ".env", override=True)
+# Load .env once at import — do not override existing process environment.
+_ENV_LOADED = False
+if not _ENV_LOADED:
+    load_dotenv(dotenv_path=_ROOT / ".env", override=False)
+    _ENV_LOADED = True
 
 
 def _env(name: str, default: str = "") -> str:
