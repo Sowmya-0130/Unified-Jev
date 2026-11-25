@@ -75,11 +75,15 @@ def _engine_creator():
     return _pyodbc_connect(read_only_intent=False)
 
 
-engine = create_engine(
-    "mssql+pyodbc://",
-    creator=_engine_creator,
-    poolclass=NullPool,
-)
+def _create_sql_engine():
+    return create_engine(
+        "mssql+pyodbc://",
+        creator=_engine_creator,
+        poolclass=NullPool,
+    )
+
+
+engine = _create_sql_engine()
 
 
 def warm_odbc_connection() -> bool:
@@ -98,7 +102,7 @@ def warm_odbc_connection() -> bool:
 
 
 def fetch_dataframe_readonly(sql: str):
-    """Run a validated SELECT (NullPool engine — same path as test_sql.py)."""
+    """Run a validated SELECT using conn.execute (same path as test_sql.py)."""
     import pandas as pd
     from sqlalchemy import text
 
@@ -112,7 +116,10 @@ def fetch_dataframe_readonly(sql: str):
         try:
             with _odbc_lock:
                 with engine.connect() as conn:
-                    return pd.read_sql(text(sql), conn)
+                    result = conn.execute(text(sql))
+                    rows = result.fetchall()
+                    columns = list(result.keys())
+            return pd.DataFrame(rows, columns=columns)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             try:
@@ -122,19 +129,26 @@ def fetch_dataframe_readonly(sql: str):
             except ImportError:
                 pass
             _log.warning("read_sql attempt %s failed: %s", attempt + 1, exc)
-            dispose_sql_engine()
             if attempt + 1 < attempts:
+                recreate_sql_engine()
                 time.sleep(1.0 * (attempt + 1))
     assert last_err is not None
     raise last_err
 
 
-def dispose_sql_engine() -> None:
-    """Release ODBC handles after heavy introspection (fixes HY000 on Windows)."""
+def recreate_sql_engine() -> None:
+    """Replace the global Engine after dispose (SQLAlchemy engines are not reusable post-dispose)."""
+    global engine
     try:
         engine.dispose(close=True)
     except Exception as exc:  # noqa: BLE001
         _log.debug("engine.dispose failed: %s", exc)
+    engine = _create_sql_engine()
+
+
+def dispose_sql_engine() -> None:
+    """Release ODBC handles and rebuild engine (required on Windows after heavy introspection)."""
+    recreate_sql_engine()
 
 
 def run_sql_with_retry(operation: Callable[[], T], *, attempts: int | None = None) -> T:
@@ -249,7 +263,7 @@ def ensure_table_schemas_loaded(*, live: bool = True) -> str:
     try:
         all_table_schemas = get_schema_tables(engine, category_name)
         _write_schema_cache(all_table_schemas)
-        dispose_sql_engine()
+        recreate_sql_engine()
     except Exception as _schema_err:  # noqa: BLE001
         _log.error("SQL schema introspection failed: %s", _schema_err)
         # Stale cache beats empty schema when ODBC blips (common on Windows after long runs).

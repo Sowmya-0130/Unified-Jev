@@ -1,19 +1,13 @@
 """Direct SQL path probe (I-10 prep): same entry as agent tool db_execute_query."""
 from __future__ import annotations
 
-import importlib
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_ROOT))
 
-import API_unified
-
-importlib.reload(API_unified)
 import aurix_core
-
-importlib.reload(aurix_core)
 
 _QUERIES = [
     ("ping", "SELECT 1 AS ok"),
