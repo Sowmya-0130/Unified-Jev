@@ -85,6 +85,17 @@ def _create_sql_engine():
 
 engine = _create_sql_engine()
 
+# ── Eagerly open one pyodbc connection at module-load time ──────────────────
+# numpy/MKL (loaded by pandas) corrupts the ODBC Driver Manager's DLL state
+# on Windows if no pyodbc connection has been made beforehand (I-10).
+# This one-shot warm-up runs before any pandas import in the caller.
+try:
+    with _odbc_lock:
+        _w = pyodbc.connect(_build_odbc_str(), autocommit=True)
+        _w.close()
+except pyodbc.Error:
+    pass  # non-fatal; will retry via warm_odbc_connection() / fetch_dataframe_readonly
+
 
 def warm_odbc_connection() -> bool:
     """Lightweight ping; returns True on success (optional at startup)."""
@@ -102,9 +113,8 @@ def warm_odbc_connection() -> bool:
 
 
 def fetch_dataframe_readonly(sql: str):
-    """Run a validated SELECT using conn.execute (same path as test_sql.py)."""
+    """Read-only SELECT via direct pyodbc connection (autocommit=True avoids HY000 on Windows)."""
     import pandas as pd
-    from sqlalchemy import text
 
     from sql_safety import assert_readonly_sql, normalize_agent_sql_identifiers
 
@@ -114,12 +124,17 @@ def fetch_dataframe_readonly(sql: str):
     attempts = max(1, AZURE_SQL_ODBC_RETRIES)
     for attempt in range(attempts):
         try:
-            with _odbc_lock:
-                with engine.connect() as conn:
-                    result = conn.execute(text(sql))
-                    rows = result.fetchall()
-                    columns = list(result.keys())
-            return pd.DataFrame(rows, columns=columns)
+            conn = pyodbc.connect(_build_odbc_str(), autocommit=True)
+            try:
+                cursor = conn.cursor()
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+                columns = [col[0] for col in cursor.description] if cursor.description else []
+            finally:
+                conn.close()
+            # pyodbc Row objects are not plain tuples; convert to avoid
+            # pandas "Shape of passed values" error on multi-column results.
+            return pd.DataFrame.from_records(rows, columns=columns)
         except Exception as exc:  # noqa: BLE001
             last_err = exc
             try:
@@ -128,9 +143,8 @@ def fetch_dataframe_readonly(sql: str):
                 bump_sql_attempt()
             except ImportError:
                 pass
-            _log.warning("read_sql attempt %s failed: %s", attempt + 1, exc)
+            _log.warning("read_sql attempt %s/%s failed: %s", attempt + 1, attempts, exc)
             if attempt + 1 < attempts:
-                recreate_sql_engine()
                 time.sleep(1.0 * (attempt + 1))
     assert last_err is not None
     raise last_err

@@ -12,19 +12,23 @@ from azure.search.documents.models import (
     VectorizedQuery
 )
 
+# ── Import order is critical on Windows (I-10) ─────────────────────────────
+# pyodbc + metadata must load (and warm one ODBC connection) BEFORE pandas/
+# numpy so that numpy's MKL DLLs do not corrupt the ODBC Driver Manager state.
+import pyodbc  # 1. pyodbc DLL loaded first
+## API_unified KEYS
+from API_unified import *
+from API_unified import Embedding_Model, FAST_LLM_DEPLOYMENT_NAME
+# JEV_* toggles come from `from API_unified import *` — off by default (see .env).
+# metadata module-level code makes one warm pyodbc.connect() before pandas (I-10).
+from metadata import *
+from metadata import dispose_sql_engine, ensure_table_schemas_loaded, warm_odbc_connection
+# 2. pandas / numpy / MKL load AFTER the ODBC warm-up above
 import asyncio
 import json
 import re
 import pandas as pd
 from sqlalchemy import text
-
-## API_unified KEYS
-from API_unified import *
-from API_unified import Embedding_Model, FAST_LLM_DEPLOYMENT_NAME
-# JEV_* toggles come from `from API_unified import *` — off by default (see .env).
-# SQL MUST be warmed before AutoGen import (pyodbc HY000 on Windows if order is reversed).
-from metadata import *
-from metadata import dispose_sql_engine, ensure_table_schemas_loaded, warm_odbc_connection
 
 _AZURE_CHAT_PROBE_DONE = False
 _AZURE_CHAT_PROBE_ERROR: str | None = None
