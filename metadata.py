@@ -1,4 +1,19 @@
 ## SQL
+# ── Windows ODBC + OpenBLAS fix (I-10) ─────────────────────────────────────
+# On Windows, numpy's OpenBLAS DLLs (loaded when pandas is first imported)
+# corrupt the ODBC Driver Manager state unless the ODBC driver DLL is already
+# loaded first.  Pre-loading it here via ctypes is the earliest hook available
+# when metadata.py is the first project module to load.  If a caller imports
+# pandas BEFORE metadata, this call runs too late and pyodbc.connect() will
+# still return HY000; the only fix in that case is to call
+#   ctypes.windll.LoadLibrary("msodbcsql18.dll")
+# in the caller's entry point, before any numpy/pandas import.
+import ctypes as _ctypes
+try:
+    _ctypes.windll.LoadLibrary("msodbcsql18.dll")
+except (AttributeError, OSError):
+    pass  # non-Windows or driver not installed
+
 import logging
 import threading
 import time
@@ -86,15 +101,28 @@ def _create_sql_engine():
 engine = _create_sql_engine()
 
 # ── Eagerly open one pyodbc connection at module-load time ──────────────────
-# numpy/MKL (loaded by pandas) corrupts the ODBC Driver Manager's DLL state
-# on Windows if no pyodbc connection has been made beforehand (I-10).
-# This one-shot warm-up runs before any pandas import in the caller.
+# numpy/OpenBLAS (loaded by pandas) can corrupt the Windows ODBC Driver
+# Manager's DLL state if no pyodbc connection has been established first (I-10).
+# This one-shot warm-up must fire before any `import pandas` in the caller;
+# it is intentionally silent on failure — the app will still start and the
+# first real query will retry via fetch_dataframe_readonly's retry loop.
 try:
     with _odbc_lock:
         _w = pyodbc.connect(_build_odbc_str(), autocommit=True)
         _w.close()
-except pyodbc.Error:
-    pass  # non-fatal; will retry via warm_odbc_connection() / fetch_dataframe_readonly
+    _log.debug("metadata: module-level ODBC warm-up succeeded")
+except pyodbc.Error as _warm_exc:
+    _log.warning(
+        "metadata: module-level ODBC warm-up failed (%s) — "
+        "DB may be unreachable at import time; queries will retry normally.",
+        _warm_exc,
+    )
+except Exception as _warm_exc:  # noqa: BLE001  (e.g. bad conn-string on first deploy)
+    _log.warning(
+        "metadata: module-level ODBC warm-up unexpected error (%s: %s) — continuing.",
+        type(_warm_exc).__name__,
+        _warm_exc,
+    )
 
 
 def warm_odbc_connection() -> bool:
