@@ -37,7 +37,6 @@ if AZURE_SQL_WARM_ON_STARTUP:
             "AZURE_SQL_WARM_ON_STARTUP is true but ODBC warm failed "
             "(set AZURE_SQL_WARM_ON_STARTUP=false to skip)."
         )
-dispose_sql_engine()
 
 from autogen import AssistantAgent, GroupChat, GroupChatManager, UserProxyAgent
 from autogen.oai.client import OpenAIWrapper
@@ -1238,7 +1237,9 @@ def db_execute_query(query: str = None, db_name: str = None) -> str:
         def _run() -> str:
             return fetch_dataframe_readonly(query).to_json(orient="records")
 
-        _out = run_sql_with_retry(_run, attempts=2)
+        from API_unified import AZURE_SQL_ODBC_RETRIES
+
+        _out = run_sql_with_retry(_run, attempts=AZURE_SQL_ODBC_RETRIES)
         return _out
     except Exception as e:
         err = str(e)
@@ -1271,7 +1272,10 @@ def state_transition(last_speaker, groupchat):
     
     if last_speaker is user_proxy:
         question = _extract_user_question(last_message)
-        safety_result = azure_safety_check(question)
+        from jev_trace import setup_step
+
+        with setup_step("azure_content_safety"):
+            safety_result = azure_safety_check(question)
         groupchat.messages.append({
             "name": "azure_safety_check",
             "role": "assistant",
@@ -1744,38 +1748,65 @@ def get_final_answer(question):
     from azure_llm_runtime import refresh_azure_openai_runtime
 
     from jev_trace import (
+        begin_chat_phase,
         finalize_agent_timeline,
         print_latency_summary,
+        record_termination,
         reset as _jev_trace_reset,
+        setup_step,
         snapshot as _jev_trace_snapshot,
         summarize_chat_agents,
     )
 
     request_id = _jev_trace_reset()
 
-    def _finish_trace(resp: dict, chat_history=None) -> dict:
+    def _finish_trace(resp: dict, chat_history=None, *, termination_reason: str | None = None) -> dict:
         if chat_history is not None:
             finalize_agent_timeline()
+        if termination_reason:
+            record_termination(termination_reason)
+        elif resp.get("Reasoning") == "JEV S2: query below clarity threshold":
+            record_termination("jev_s2_clarity_block")
+        elif resp.get("jev_cache_hit"):
+            record_termination("jev_s3_cache_hit")
+        elif chat_history is not None:
+            rai = resp.get("rai_evaluation") or {}
+            if rai and not rai.get("rai_check_passed", True):
+                record_termination(
+                    "rai_blocked",
+                    blocked_reason=rai.get("blocked_reason") or rai.get("reason"),
+                )
+            else:
+                names = [m.get("name") for m in getattr(chat_history, "chat_history", []) or []]
+                if "routing_agent" not in names and "Sql_Generator" not in names:
+                    record_termination("chat_ended_before_routing", last_agent=names[-1] if names else None)
+                else:
+                    record_termination("completed", last_agent=names[-1] if names else None)
+        else:
+            record_termination(termination_reason or "early_exit")
         trace = _jev_trace_snapshot()
         if chat_history is not None:
             trace.update(summarize_chat_agents(chat_history))
         print_latency_summary(trace.get("latency"))
         resp["jev_trace"] = trace
         return resp
-    endpoint, client = refresh_azure_openai_runtime(llm_config)
+
+    with setup_step("azure_openai_refresh"):
+        endpoint, client = refresh_azure_openai_runtime(llm_config)
 
     if AZURE_OPENAI_PROBE_BEFORE_CHAT:
         from azure_credential import probe_azure_openai_chat
 
-        if not _AZURE_CHAT_PROBE_DONE:
-            _AZURE_CHAT_PROBE_ERROR = probe_azure_openai_chat(
+        with setup_step("azure_openai_probe"):
+            if not _AZURE_CHAT_PROBE_DONE:
+                _AZURE_CHAT_PROBE_ERROR = probe_azure_openai_chat(
                 api_key=llm_config["config_list"][0].get("api_key", ""),
                 api_version=llm_config["config_list"][0].get("api_version", ""),
                 base_url=endpoint,
                 deployment=llm_config["config_list"][0].get("azure_deployment", ""),
-                timeout_sec=min(30.0, float(AZURE_LLM_REQUEST_TIMEOUT)),
-            )
-            _AZURE_CHAT_PROBE_DONE = True
+                    timeout_sec=min(30.0, float(AZURE_LLM_REQUEST_TIMEOUT)),
+                )
+                _AZURE_CHAT_PROBE_DONE = True
         _probe_err = _AZURE_CHAT_PROBE_ERROR
         if _probe_err:
             _fail = {
@@ -1792,7 +1823,7 @@ def get_final_answer(question):
                 "Reasoning": "Azure OpenAI probe failed before agents.",
                 "final_answer": {"query_answer": "", "llm_answer": _probe_err},
             }
-            return _finish_trace(_fail)
+            return _finish_trace(_fail, termination_reason="azure_openai_probe_failed")
 
     response = {
         "query": "",
@@ -1867,12 +1898,14 @@ def get_final_answer(question):
         logging_session_id = autogen.runtime_logging.start(config={"dbname": str(log_db)})
         print("Logging session ID: " + str(logging_session_id))
     start = time.time()
+    begin_chat_phase()
     try:
-        chat_history = user_proxy.initiate_chat(
-            manager,
-            message=template,
-            summary_method="reflection_with_llm",
-        )
+        with setup_step("initiate_chat"):
+            chat_history = user_proxy.initiate_chat(
+                manager,
+                message=template,
+                summary_method="reflection_with_llm",
+            )
     except Exception as chat_exc:  # noqa: BLE001
         msg = str(chat_exc)
         if (
@@ -1900,7 +1933,7 @@ def get_final_answer(question):
         response["llm_answer"] = msg
         response["Reasoning"] = type(chat_exc).__name__
         response["final_answer"] = {"query_answer": "", "llm_answer": msg}
-        return _finish_trace(response)
+        return _finish_trace(response, termination_reason="initiate_chat_exception")
     finally:
         if logging_session_id is not None:
             autogen.runtime_logging.stop()

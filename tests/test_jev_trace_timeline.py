@@ -26,6 +26,7 @@ def test_agent_transition_records_wall_time():
     import time
 
     jev_trace.reset()
+    jev_trace.begin_chat_phase()
 
     class _A:
         name = "user_proxy"
@@ -39,4 +40,4 @@ def test_agent_transition_records_wall_time():
     jev_trace.finalize_agent_timeline()
     summary = jev_trace.summarize_latency()
     assert summary["llm_turn_count"] >= 1
-    assert any(s["name"] == "user_proxy" for s in summary["timeline"])
+    assert any(s["kind"] == "setup" and s["name"] == "autogen_user_proxy" for s in summary["timeline"])

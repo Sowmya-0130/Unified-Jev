@@ -5,7 +5,8 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, Callable, TypeVar
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, TypeVar
 
 _log = logging.getLogger("aurix.jev_trace")
 
@@ -15,7 +16,9 @@ _request_id: str = ""
 _t0: float = 0.0
 _segment_start: float = 0.0
 _last_turn_agent: str | None = None
+_chat_phase_started: bool = False
 _sql_attempts: int = 0
+_termination: dict[str, Any] | None = None
 
 T = TypeVar("T")
 
@@ -40,13 +43,16 @@ _LLM_AGENT_NAMES = frozenset(
 
 def reset() -> str:
     global _request_id, _events, _timeline, _t0, _segment_start, _last_turn_agent, _sql_attempts
+    global _chat_phase_started, _termination
     _request_id = uuid.uuid4().hex[:12]
     _events = []
     _timeline = []
     _t0 = time.perf_counter()
     _segment_start = _t0
     _last_turn_agent = None
+    _chat_phase_started = False
     _sql_attempts = 0
+    _termination = None
     return _request_id
 
 
@@ -85,18 +91,48 @@ def record_step(
     _timeline.append(row)
 
 
+def begin_chat_phase() -> None:
+    """Start agent-segment timing at initiate_chat (excludes pre-chat setup)."""
+    global _segment_start, _chat_phase_started
+    _chat_phase_started = True
+    _segment_start = time.perf_counter()
+
+
+@contextmanager
+def setup_step(name: str) -> Iterator[None]:
+    t0 = time.perf_counter()
+    status = "ok"
+    try:
+        yield
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        record_step("setup", name, (time.perf_counter() - t0) * 1000, status=status)
+
+
+def record_termination(reason: str, **fields: Any) -> None:
+    global _termination
+    row = {"reason": reason, **{k: v for k, v in fields.items() if v is not None}}
+    _termination = row
+    event("termination", **row)
+
+
 def mark_agent_transition(last_speaker: Any) -> None:
-    """Record wall time for the agent turn that just finished."""
+    """Record wall time for the agent that just finished speaking."""
     global _segment_start, _last_turn_agent
+    if not _chat_phase_started:
+        return
     now = time.perf_counter()
     name = getattr(last_speaker, "name", None) or str(last_speaker)
-    if _last_turn_agent is not None and _segment_start > 0:
-        record_step(
-            "agent_turn",
-            _last_turn_agent,
-            (now - _segment_start) * 1000,
-            status="ok",
-        )
+    if _segment_start > 0:
+        dur = (now - _segment_start) * 1000
+        if name == "user_proxy":
+            record_step("setup", "autogen_user_proxy", dur, status="ok")
+        elif name in _LLM_AGENT_NAMES:
+            record_step("agent_turn", name, dur, status="ok")
+        else:
+            record_step("setup", name, dur, status="ok")
     _last_turn_agent = name
     _segment_start = now
 
@@ -104,15 +140,17 @@ def mark_agent_transition(last_speaker: Any) -> None:
 def finalize_agent_timeline() -> None:
     """Close the last open agent segment after initiate_chat returns."""
     global _segment_start, _last_turn_agent
-    if _last_turn_agent is None or _segment_start <= 0:
+    if not _chat_phase_started or _last_turn_agent is None or _segment_start <= 0:
         return
     now = time.perf_counter()
-    record_step(
-        "agent_turn",
-        _last_turn_agent,
-        (now - _segment_start) * 1000,
-        status="ok",
-    )
+    name = _last_turn_agent
+    dur = (now - _segment_start) * 1000
+    if name in _LLM_AGENT_NAMES:
+        record_step("agent_turn", name, dur, status="ok")
+    elif name == "user_proxy":
+        record_step("setup", "autogen_user_proxy", dur, status="ok")
+    else:
+        record_step("setup", name, dur, status="ok")
     _last_turn_agent = None
     _segment_start = now
 
@@ -147,8 +185,10 @@ def event(gate: str, **fields: Any) -> None:
 
 def summarize_latency() -> dict[str, Any]:
     agent_steps = [s for s in _timeline if s["kind"] == "agent_turn"]
+    setup_steps = [s for s in _timeline if s["kind"] == "setup"]
     db_steps = [s for s in _timeline if s["kind"] == "tool"]
     jev_steps = [s for s in _timeline if s["kind"] == "jev"]
+    total_setup_ms = round(sum(s["duration_ms"] for s in setup_steps), 1)
 
     total_llm_ms = round(
         sum(s["duration_ms"] for s in agent_steps if s["name"] in _LLM_AGENT_NAMES),
@@ -188,6 +228,8 @@ def summarize_latency() -> dict[str, Any]:
         "jev_skipped_llm_agents": jev_skipped_llm,
         "db_tool_calls": len(db_steps),
         "jev_calls": len(jev_steps),
+        "total_setup_ms": total_setup_ms,
+        "termination": dict(_termination) if _termination else None,
         "top5_slowest": top5,
         "timeline": list(_timeline),
     }
@@ -198,9 +240,10 @@ def print_latency_summary(summary: dict[str, Any] | None = None) -> None:
     lines = [
         "",
         "=== AURIX latency summary (request %s) ===" % summary.get("request_id", "?"),
-        "total_ms=%s  llm_ms=%s  db_ms=%s  jev_ms=%s"
+        "total_ms=%s  setup_ms=%s  llm_ms=%s  db_ms=%s  jev_ms=%s"
         % (
             summary["total_ms"],
+            summary.get("total_setup_ms", 0),
             summary["total_llm_ms"],
             summary["total_db_ms"],
             summary["total_jev_ms"],
@@ -226,6 +269,8 @@ def print_latency_summary(summary: dict[str, Any] | None = None) -> None:
                 row.get("retry_count", 0),
             )
         )
+    if summary.get("termination"):
+        lines.append("termination: %s" % summary["termination"].get("reason", "?"))
     text = "\n".join(lines)
     print(text)
     _log.info(text)
