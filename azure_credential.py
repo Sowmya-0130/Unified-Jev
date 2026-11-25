@@ -1,6 +1,20 @@
 """Azure OpenAI credential sanity check (no secrets in logs)."""
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
+
+def azure_openai_endpoint_auth_user_message(base_url: str, *, status: str = "401") -> str:
+    """User-facing text for auth/endpoint failures (host only, never keys)."""
+    raw = (base_url or "").strip().rstrip("/")
+    host = urlparse(raw if "://" in raw else f"https://{raw}").hostname or raw or "(not set)"
+    return (
+        f"Can't reach Azure OpenAI: the configured endpoint "
+        f"({host}) returned {status} 'invalid key or wrong API endpoint'. "
+        "Check AZURE_OPENAI_API_BASE, AZURE_OPENAI_API_KEY, "
+        "GPT4_LLM_MODEL_DEPLOYMENT_NAME and AZURE_OPENAI_API_VERSION in .env."
+    )
+
 
 def mask_secret(value: str | None) -> str:
     if not value:
@@ -41,12 +55,8 @@ def probe_azure_openai_chat(
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
         if "401" in err or "403" in err or "Authentication" in type(exc).__name__:
-            return (
-                "Azure OpenAI rejected the API key for the configured endpoint. "
-                "This repo’s GitHub copy did not include a working `.env` — ask the project owner "
-                "(Sowmya/repo team) for `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_API_BASE`, and "
-                f"`GPT4_LLM_MODEL_DEPLOYMENT_NAME` (current deployment name: {deployment!r})."
-            )
+            status = "403" if "403" in err else "401"
+            return azure_openai_endpoint_auth_user_message(base_url, status=status)
         if "DeploymentNotFound" in err or "404" in err:
             return (
                 f"Deployment {deployment!r} was not found on the configured endpoint. "

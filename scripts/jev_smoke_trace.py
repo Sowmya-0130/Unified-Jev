@@ -64,7 +64,7 @@ def run_case(label: str, question: str) -> None:
     except Exception as exc:
         msg = str(exc)
         if "401" in msg or "403" in msg:
-            print("ERROR CLASS: 401/403 credentials — stop; need correct .env from repo owner.")
+            print("ERROR CLASS: 401/403 credentials — stop; fix Azure settings in .env.")
         elif "getaddrinfo" in msg.lower() or "cannot resolve" in msg.lower():
             print("ERROR CLASS: DNS — alias/resolution issue")
         else:

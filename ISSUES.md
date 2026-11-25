@@ -46,6 +46,8 @@
 
 **`*.openai.azure.com` nslookup:** only `placeholder.openai.azure.com` resolves publicly; `aipractices.openai.azure.com` does not — **no alternate live OpenAI hostname for `aipractices` in public DNS**.
 
-## Message for Sowmya (ENDPOINT case)
+## Remediation (I-01 ENDPOINT)
 
-> Hi Sowmya — `aipractices.openai.azure.com` does not exist in public DNS (NXDOMAIN), while `.env` uses `https://aipractices.cognitiveservices.azure.com/`. Both API keys return HTTP **401** with *"invalid subscription key or wrong API endpoint"*. Can you paste the **exact Endpoint URL from Azure Portal** (Keys and Endpoint) for the OpenAI resource we should use, confirm the resource still exists and has chat deployment **gpt-5.4** (or give the correct deployment name), and whether keys were issued for that same resource (not a different one)?
+- Copy **Endpoint** and **Key** from the same Azure OpenAI / Cognitive Services resource in Azure Portal into `.env` (`AZURE_OPENAI_API_BASE`, `AZURE_OPENAI_API_KEY`).
+- Prefer the Portal hostname (often `https://<resource>.openai.azure.com/`); if public DNS is NXDOMAIN for `openai.azure.com`, verify the cognitiveservices hostname matches that resource.
+- Align `GPT4_LLM_MODEL_DEPLOYMENT_NAME` and `AZURE_OPENAI_API_VERSION` with that resource’s deployment and API version.

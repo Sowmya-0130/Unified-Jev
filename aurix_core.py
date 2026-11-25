@@ -1807,11 +1807,21 @@ def get_final_answer(question):
         )
     except Exception as chat_exc:  # noqa: BLE001
         msg = str(chat_exc)
-        if "Connection" in type(chat_exc).__name__ or "connection" in msg.lower():
+        if (
+            "401" in msg
+            or "403" in msg
+            or "invalid subscription key" in msg.lower()
+            or "wrong api endpoint" in msg.lower()
+        ):
+            from azure_credential import azure_openai_endpoint_auth_user_message
+
+            status = "403" if "403" in msg else "401"
+            msg = azure_openai_endpoint_auth_user_message(endpoint, status=status)
+        elif "Connection" in type(chat_exc).__name__ or "connection" in msg.lower():
             msg = (
                 f"{msg} — Azure OpenAI is unreachable. "
                 "Fix AZURE_OPENAI_API_BASE / API key / deployment in .env "
-                "(Portal → your OpenAI resource → Keys and Endpoint)."
+                "(Azure Portal → your OpenAI resource → Keys and Endpoint)."
             )
         response["llm_answer"] = msg
         response["Reasoning"] = type(chat_exc).__name__
@@ -2001,9 +2011,9 @@ def get_final_answer(question):
     return response
 
 # # question = "Which product has the lowest stock in my inventory and list down the distributors supplying that product?, mail_id :i-saranya.swadha@affine.ai"
-# question = "Which distributors supply Corian Solid Surface with price and what steps should I follow to return a damaged product? "#, mail_id :i-sowmya.sri@affine.ai
-# # question = "Which is the lowest stock product in my invenntory and have i placed any order for it, who are the distributors for that product with their pricing and return policy ?, mail_id :i-sowmya.sri@affine.ai" 
-# # question = "Which distributors supply which products?, mail_id :i-sowmya.sri@affine.ai"
+# question = "Which distributors supply Corian Solid Surface with price and what steps should I follow to return a damaged product?"
+# # question = "Which is the lowest stock product in my inventory ..."
+# # question = "Which distributors supply which products?"
 # # question = "What is the total stock available in my inventory? " # SQL
 # # question = "what steps should I follow to return a damaged product?"
 # # question = "What is the total amount I spent on Chemical Resistant Boots and Kevlar Gloves in the last two months?, mail_id :i-saranya.swadha@affine.ai"

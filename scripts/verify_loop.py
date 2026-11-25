@@ -37,7 +37,7 @@ def main() -> int:
     print("\n=== SUMMARY ===", "ALL OK" if ok else "SOME CHECKS FAILED")
     if not ok:
         print(
-            "If test_azure_openai failed with 401: get working Azure keys from repo owner "
+            "If test_azure_openai failed with 401: fix AZURE_OPENAI_API_BASE and keys in .env "
             "(GitHub never shipped .env). SQL/JEV/code fixes cannot replace invalid credentials."
         )
     return 0 if ok else 1
