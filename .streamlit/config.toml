@@ -1,0 +1,3 @@
+# Stop Streamlit from reloading the app when AutoGen / tools touch files in the project.
+[server]
+fileWatcherType = "none"

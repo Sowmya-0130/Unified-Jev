@@ -1,33 +1,154 @@
-## SQL 
-import urllib
-from sqlalchemy import create_engine, inspect
+## SQL
+import logging
+import threading
+import time
+from pathlib import Path
+from typing import Callable, TypeVar
+
+import pyodbc
 from azure.search.documents import SearchClient
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.pool import NullPool
+
 from API_unified import *
 
+_log = logging.getLogger(__name__)
+_odbc_lock = threading.RLock()
+T = TypeVar("T")
 
-# Set the schema name dynamically
-# category_name = 'retail'  # Modify this variable as needed
-index_name = "dbo"
-search_client = SearchClient(endpoint=AZURE_SEARCH_SERVICE_ENDPOINT,index_name=index_name,
-                            credential=azure_search_credential
-                            )
+
+search_client = SearchClient(
+    endpoint=AZURE_SEARCH_SERVICE_ENDPOINT,
+    index_name=IN_Name,
+    credential=azure_search_credential,
+)
                             
-# Parameters
-server = 'sqlinternserver.database.windows.net'
-database = 'sqlintern_database'
-username = 'sqlserverintern'
-password = 'intern@12345'
-driver = 'ODBC Driver 18 for SQL Server'
-encoding = 'ISO-8859-1'
-# Set the schema name dynamically
-# category_name = 'retail'  # Modify this variable as needed
-category_name = 'dbo'
+# Parameters — from .env via API_unified (AZURE_SQL_*)
+server = AZURE_SQL_SERVER
+database = AZURE_SQL_DATABASE
+username = AZURE_SQL_USERNAME
+password = AZURE_SQL_PASSWORD
+driver = AZURE_SQL_DRIVER
+encoding = "ISO-8859-1"
+category_name = AZURE_SQL_SCHEMA
 #hr
-# Step 1: Connection string for Azure SQL Database
-connection_string = f'mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(f"DRIVER={driver};SERVER={server};DATABASE={database};UID={username};PWD={password}")}'
+def _build_odbc_str(*, read_only_intent: bool = False) -> str:
+    """Build fresh ODBC string from current .env-backed vars (password special chars safe)."""
+    encrypt = "yes" if AZURE_SQL_ENCRYPT else "no"
+    trust = "yes" if AZURE_SQL_TRUST_SERVER_CERTIFICATE else "no"
+    parts = [
+        f"DRIVER={{{driver}}};",
+        f"SERVER={server};",
+        f"DATABASE={database};",
+        f"UID={username};",
+        f"PWD={password};",
+        f"Encrypt={encrypt};",
+        f"TrustServerCertificate={trust};",
+        f"Connection Timeout={AZURE_SQL_CONNECTION_TIMEOUT};",
+    ]
+    if AZURE_SQL_MARS_CONNECTION:
+        parts.append("MARS_Connection=Yes;")
+    if read_only_intent and AZURE_SQL_USE_READONLY_INTENT:
+        parts.append("ApplicationIntent=ReadOnly;")
+    return "".join(parts)
 
-# Create the SQLAlchemy engine
-engine = create_engine(connection_string)
+
+def _pyodbc_connect(*, read_only_intent: bool = False):
+    """
+    Direct ODBC connect with retries.
+    After long AutoGen runs / LanceDB use, pooled handles on Windows often fail with HY000.
+    """
+    last_err: Exception | None = None
+    attempts = max(1, AZURE_SQL_ODBC_RETRIES)
+    for attempt in range(attempts):
+        try:
+            with _odbc_lock:
+                return pyodbc.connect(_build_odbc_str(read_only_intent=read_only_intent))
+        except pyodbc.Error as exc:
+            last_err = exc
+            if attempt + 1 >= attempts:
+                _log.warning("ODBC connect attempt %s/%s failed: %s", attempt + 1, attempts, exc)
+            else:
+                _log.debug("ODBC connect attempt %s/%s failed: %s", attempt + 1, attempts, exc)
+            time.sleep(0.75 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
+
+
+# NullPool = new physical connection per checkout (avoids stale ODBC pool after graphrag)
+def _engine_creator():
+    return _pyodbc_connect(read_only_intent=False)
+
+
+engine = create_engine(
+    "mssql+pyodbc://",
+    creator=_engine_creator,
+    poolclass=NullPool,
+)
+
+
+def warm_odbc_connection() -> bool:
+    """Lightweight ping; returns True on success (optional at startup)."""
+    try:
+        with _odbc_lock:
+            conn = pyodbc.connect(_build_odbc_str(read_only_intent=False))
+            try:
+                conn.cursor().execute("SELECT 1")
+                return True
+            finally:
+                conn.close()
+    except pyodbc.Error as exc:
+        _log.debug("ODBC warm failed: %s", exc)
+        return False
+
+
+def fetch_dataframe_readonly(sql: str):
+    """Run a validated SELECT via a fresh pyodbc connection (bypasses stale SQLAlchemy pool)."""
+    from sql_safety import assert_readonly_sql
+
+    assert_readonly_sql(sql)
+    last_err: Exception | None = None
+    attempts = max(1, AZURE_SQL_ODBC_RETRIES)
+    for attempt in range(attempts):
+        try:
+            with _odbc_lock:
+                conn = pyodbc.connect(_build_odbc_str(read_only_intent=True))
+                try:
+                    import pandas as pd
+
+                    return pd.read_sql(sql, conn)
+                finally:
+                    conn.close()
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            _log.warning("read_sql attempt %s failed: %s", attempt + 1, exc)
+            time.sleep(1.0 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
+
+
+def dispose_sql_engine() -> None:
+    """Release ODBC handles after heavy introspection (fixes HY000 on Windows)."""
+    try:
+        engine.dispose(close=True)
+    except Exception as exc:  # noqa: BLE001
+        _log.debug("engine.dispose failed: %s", exc)
+
+
+def run_sql_with_retry(operation: Callable[[], T], *, attempts: int | None = None) -> T:
+    """Run a DB operation with retries (ODBC HY000 after long AutoGen runs on Windows)."""
+    tries = max(1, attempts or AZURE_SQL_ODBC_RETRIES)
+    last_err: Exception | None = None
+    for attempt in range(tries):
+        try:
+            return operation()
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            _log.warning("SQL operation attempt %s/%s failed: %s", attempt + 1, tries, exc)
+            if attempt + 1 < tries:
+                time.sleep(1.25 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
 
 # Step 2: Fetch tables from the specified schema dynamically
 def get_schema_tables(engine, schema_name):
@@ -50,176 +171,93 @@ def get_schema_tables(engine, schema_name):
 
     return schema_details
 
-# Fetch tables from the dynamically specified schema
-all_table_schemas = get_schema_tables(engine, category_name)
-# print(all_table_schemas)
-
-# # **************************************************************************************************************************************************************************************
-# # **************************************************************************************************************************************************************************************
-
-# # ## SAP
-
-# SAP_Data = """ Tables in schema 'DBADMIN':
-#    - Cust_Dustributor_ID
-#       Columns:
-# ('DBADMIN', 'Cust_Dustributor_ID', 'Customer_ID', 1, 'NVARCHAR', 50, None, 'FALSE', None)
-# ('DBADMIN', 'Cust_Dustributor_ID', 'Distributor_ID', 2, 'INTEGER', 10, 0, 'FALSE', None)
-# --------------------------------------------------
-#    - Distributor_Orders
-#       Columns:
-# ('DBADMIN', 'Distributor_Orders', 'Distributor_Order_ID', 1, 'INTEGER', 10, 0, 'FALSE', None)
-# ('DBADMIN', 'Distributor_Orders', 'Distributor_ID', 2, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Orders', 'Order_Date', 3, 'DATE', 10, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Orders', 'Order_Status', 4, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Orders', 'Total_Amount', 5, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Orders', 'Currency', 6, 'NVARCHAR', 50, None, 'TRUE', None)
-# --------------------------------------------------
-#    - Distributor_Products
-#       Columns:
-# ('DBADMIN', 'Distributor_Products', 'Distributor_Product_ID', 1, 'INTEGER', 10, 0, 'FALSE', None)
-# ('DBADMIN', 'Distributor_Products', 'Distributor_ID', 2, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Product_ID', 3, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Product_Name', 4, 'NVARCHAR', 100, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Category', 5, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Price', 6, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Currency', 7, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Available_Stock', 8, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributor_Products', 'Delivery_Lead_Time', 9, 'INTEGER', 10, 0, 'TRUE', None)
-# --------------------------------------------------
-#    - Distributors
-#       Columns:
-# ('DBADMIN', 'Distributors', 'Distributor_ID', 1, 'INTEGER', 10, 0, 'FALSE', None)
-# ('DBADMIN', 'Distributors', 'Distributor_Name', 2, 'NVARCHAR', 100, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Contact_Person', 3, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Email', 4, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Phone', 5, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Location', 6, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Rating', 7, 'DECIMAL', 34, None, 'TRUE', None)
-# ('DBADMIN', 'Distributors', 'Status', 8, 'NVARCHAR', 50, None, 'TRUE', None)
-# --------------------------------------------------
-#    - Product_Pricing_History
-#       Columns:
-# ('DBADMIN', 'Product_Pricing_History', 'Price_History_ID', 1, 'INTEGER', 10, 0, 'FALSE', None)
-# ('DBADMIN', 'Product_Pricing_History', 'Distributor_ID', 2, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Product_Pricing_History', 'Product_ID', 3, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Product_Pricing_History', 'Previous_Price', 4, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Product_Pricing_History', 'New_Price', 5, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Product_Pricing_History', 'Change_Date', 6, 'DATE', 10, None, 'TRUE', None)
-# --------------------------------------------------
-#    - Shipment_Tracking
-#       Columns:
-# ('DBADMIN', 'Shipment_Tracking', 'Shipment_ID', 1, 'INTEGER', 10, 0, 'FALSE', None)
-# ('DBADMIN', 'Shipment_Tracking', 'Distributor_Order_ID', 2, 'INTEGER', 10, 0, 'TRUE', None)
-# ('DBADMIN', 'Shipment_Tracking', 'Shipment_Date', 3, 'DATE', 10, None, 'TRUE', None)
-# ('DBADMIN', 'Shipment_Tracking', 'Delivery_Status', 4, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Shipment_Tracking', 'Carrier', 5, 'NVARCHAR', 50, None, 'TRUE', None)
-# ('DBADMIN', 'Shipment_Tracking', 'Estimated_Delivery_Date', 6, 'DATE', 10, None, 'TRUE', None)
-# --------------------------------------------------
+# Loaded on demand via ensure_table_schemas_loaded() (fast Streamlit first paint).
+all_table_schemas: str = ""
 
 
-# """
-
-# # Connect to SAP HANA
-# try:
-#     connection = dbapi.connect(
-#         address=sap_address,
-#         port=sap_port,
-#         user=sap_user,
-#         password=sap_password,
-#         encrypt=True,   # Required for TLS/SSL connections
-#         sslValidateCertificate=False  # Disable SSL validation (optional)
-#     )
-#     print("✅ Connected to SAP HANA successfully!")
-# except Exception as e:
-#     print(f"❌ Connection failed: {e}")
+def _schema_cache_path() -> Path:
+    return Path(SQL_SCHEMA_CACHE_PATH)
 
 
-# # Function to get tables from SAP HANA
-# def get_sap_tables():
-#     cursor = connection.cursor()
-
-#     # Fetch all tables from the DBADMIN schema
-#     cursor.execute("SELECT TABLE_NAME FROM PUBLIC.TABLES WHERE SCHEMA_NAME = 'DBADMIN'")
-#     tables = cursor.fetchall()  
-
-#     schema_details = ""
-#     for (table_name,) in tables:
-#         # Fetch columns for each table
-#         cursor.execute(f"SELECT COLUMN_NAME, DATA_TYPE_NAME FROM PUBLIC.TABLE_COLUMNS WHERE TABLE_NAME = '{table_name}' AND SCHEMA_NAME = 'DBADMIN'")
-#         columns = cursor.fetchall()
-
-#         # Format table schema
-#         schema = f'schema = "DBADMIN", table_name = "DBADMIN.{table_name}", {table_name}_table = Table(\n'
-#         for column_name, column_type in columns:
-#             schema += f'    Column("{column_name}", {column_type}),\n'
-#         schema = schema.rstrip(',\n') + "\n)\n\n"  # Remove last comma
-#         schema_details += schema
-
-#     return schema_details
-
-# # Fetch and print SAP schema details
-# Sap_Data = get_sap_tables()#
-# # print(Sap_Data)
-
-# **************************************************************************************************************************************************************************************
-# **************************************************************************************************************************************************************************************
+def _read_schema_cache() -> str | None:
+    if not SQL_SCHEMA_CACHE_ENABLED:
+        return None
+    path = _schema_cache_path()
+    if not path.is_file():
+        return None
+    age = time.time() - path.stat().st_mtime
+    if age > SQL_SCHEMA_CACHE_MAX_AGE_SEC:
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        return text if text.strip() else None
+    except OSError as exc:
+        _log.warning("Could not read SQL schema cache %s: %s", path, exc)
+        return None
 
 
-# ## Salesforce
+def _write_schema_cache(text: str) -> None:
+    if not SQL_SCHEMA_CACHE_ENABLED or not text.strip():
+        return
+    path = _schema_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        _log.warning("Could not write SQL schema cache %s: %s", path, exc)
 
-# Salesforce_Data = """**Meta_Data for Salesforce DB**:
 
-# Table Name: Customer_stockin__c     
-# Field Name: Quantity_Left__c, Field Type: double     
-# Field Name: Category__c, Field Type: string 
-# Field Name: Product_Name__c, Field Type: string
+def ensure_table_schemas_loaded(*, live: bool = True) -> str:
+    """Fetch SQL table metadata once per process (optional disk cache)."""
+    global all_table_schemas
+    if all_table_schemas:
+        return all_table_schemas
 
-# Table Name: Customer_Info__c
-# Field Name: Customer_ID__c, Field Type: string 
-# Field Name: Email_ID__c, Field Type: email
-# """
+    cached = _read_schema_cache()
+    if cached is not None:
+        all_table_schemas = cached
+        _log.info("SQL schemas loaded from cache (%s chars)", len(all_table_schemas))
+        return all_table_schemas
 
-# # Connect to Salesforce
-# sf = Salesforce(username=salesforce_username, password=salesforce_password, security_token=salesforce_security_token, domain=salesforce_domain)
+    if not SQL_SCHEMA_FORCE_LIVE_REFRESH:
+        stale = _read_schema_cache_ignore_age()
+        if stale is not None:
+            all_table_schemas = stale
+            _log.info(
+                "SQL schemas loaded from stale cache (%s chars); "
+                "set SQL_SCHEMA_FORCE_LIVE_REFRESH=true to refresh via ODBC",
+                len(all_table_schemas),
+            )
+            return all_table_schemas
 
-# print("✅ Connected to Salesforce successfully!")
+    if not live:
+        _log.info("Skipping live SQL introspection (cache miss; live=False).")
+        return all_table_schemas
 
-# # Tables to fetch metadata for
-# required_tables = ["Customer_stockin__c", "Customer_Info__c"]
+    try:
+        all_table_schemas = get_schema_tables(engine, category_name)
+        _write_schema_cache(all_table_schemas)
+        dispose_sql_engine()
+    except Exception as _schema_err:  # noqa: BLE001
+        _log.error("SQL schema introspection failed: %s", _schema_err)
+        # Stale cache beats empty schema when ODBC blips (common on Windows after long runs).
+        stale = _read_schema_cache_ignore_age()
+        if stale is not None:
+            all_table_schemas = stale
+            _log.warning("Using stale SQL schema cache after introspection failure")
+        else:
+            all_table_schemas = ""
+        dispose_sql_engine()
+    return all_table_schemas
 
-# # Function to fetch metadata for required tables
-# def get_selected_salesforce_metadata():
-#     metadata_details = ""
 
-#     for table in required_tables:
-#         try:
-#             metadata_details += f"Table Name: {table}\n"
-
-#             # Fetch object fields
-#             fields = sf.__getattr__(table).describe()["fields"]
-#             for field in fields:
-#                 field_name = field["name"]
-#                 field_type = field["type"]
-#                 metadata_details += f"  Field Name: {field_name}, Field Type: {field_type}\n"
-
-#             metadata_details += "-" * 50 + "\n"  # Separator
-
-#         except Exception as e:
-#             print(f"⚠️ Error fetching metadata for {table}: {e}")
-
-#     return metadata_details
-
-# # Fetch and print metadata
-# Salesforce_Data = get_selected_salesforce_metadata()
-# print(Salesforce_Data)
-
-# **************************************************************************************************************************************************************************************
-# **************************************************************************************************************************************************************************************
-
-## Eryl Data
-
-Vector_Data = [ "policy","return","product features","discounts","discount rate", "dilvery terms", "restock", "damage", "warranty"] # vector db
-
-Web_Search_Data =["stock market"]
-
-# stock market--> selector type= vector search or web search
+def _read_schema_cache_ignore_age() -> str | None:
+    path = _schema_cache_path()
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+        return text if text.strip() else None
+    except OSError:
+        return None
+# Eryl / semantic hints: Vector_Data, Web_Search_Data from API_unified / .env

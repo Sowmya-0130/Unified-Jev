@@ -1,13 +1,30 @@
-from config import *
+from API_unified import *
 import os
 
+import pandas as pd
+import tiktoken
+from graphrag.query.context_builder.entity_extraction import EntityVectorStoreKey
+from graphrag.query.indexer_adapters import (
+    read_indexer_entities,
+    read_indexer_relationships,
+    read_indexer_reports,
+    read_indexer_text_units,
+)
+from graphrag.query.input.loaders.dfs import store_entity_semantic_embeddings
+from graphrag.query.llm.oai.chat_openai import ChatOpenAI
+from graphrag.query.llm.oai.embedding import OpenAIEmbedding
+from graphrag.query.llm.oai.typing import OpenaiApiType
+from graphrag.query.structured_search.local_search.mixed_context import LocalSearchMixedContext
+from graphrag.query.structured_search.local_search.search import LocalSearch
+from graphrag.vector_stores.lancedb import LanceDBVectorStore
+
 LANCEDB_URI = f"{INPUT_DIR}/lancedb"
-COMMUNITY_REPORT_TABLE = "create_final_community_reports"
-ENTITY_TABLE = "create_final_nodes"
-ENTITY_EMBEDDING_TABLE = "create_final_entities"
-RELATIONSHIP_TABLE = "create_final_relationships"
-TEXT_UNIT_TABLE = "create_final_text_units"
-COMMUNITY_LEVEL = 3
+COMMUNITY_REPORT_TABLE = GRAPH_COMMUNITY_REPORT_TABLE
+ENTITY_TABLE = GRAPH_ENTITY_TABLE
+ENTITY_EMBEDDING_TABLE = GRAPH_ENTITY_EMBEDDING_TABLE
+RELATIONSHIP_TABLE = GRAPH_RELATIONSHIP_TABLE
+TEXT_UNIT_TABLE = GRAPH_TEXT_UNIT_TABLE
+COMMUNITY_LEVEL = GRAPH_COMMUNITY_LEVEL
 
 
 def _load_parquet(table_name: str) -> pd.DataFrame:
@@ -54,7 +71,7 @@ llm = ChatOpenAI(
     api_key=graph_api_key,
     api_base= graph_api_base,
     api_version=graph_api_version,
-    deployment_name="gpt-4o-08-06",
+    deployment_name=graph_llm_deployment,
     model=graph_llm_model,
     api_type=OpenaiApiType.AzureOpenAI,
     max_retries=20,
@@ -111,5 +128,3 @@ Localsearch_engine = LocalSearch(
                 context_builder_params=local_context_params,
                 response_type="single paragraphs",  # free form text describing the response type and format, can be anything, e.g. prioritized list, single paragraph, multiple paragraphs, multiple-page report
             )
-
-

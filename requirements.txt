@@ -1,5 +1,6 @@
 sqlalchemy
 azure-search-documents
+azure-identity
 python-dotenv
 pyautogen==0.2.35
 pandas
@@ -7,9 +8,12 @@ tiktoken
 graphrag==0.3.6
 lancedb
 openai
-pyarrow
+pyarrow>=15.0.0,<16.0.0
+numpy>=1.26.4,<2
 duckdb
-numpy
 scipy
 aiohttp
 tqdm
+streamlit
+httpx
+# typesafe-sdk   # optional — alternative to httpx for OpenJev; uncomment if preferred
