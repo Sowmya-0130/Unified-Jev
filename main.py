@@ -1,27 +1,22 @@
 """AURIX Streamlit UI — same layout as before; backend loads via cached aurix_core."""
+# ── Windows ODBC guard (I-10) ────────────────────────────────────────────────
+# Must be the FIRST executable lines: load the ODBC driver DLL before
+# numpy/OpenBLAS (pulled in by streamlit→pandas) can corrupt ODBC state.
 import sys
+if sys.platform == "win32":
+    import ctypes as _ctypes
+    import logging as _logging
+    try:
+        _ctypes.windll.LoadLibrary("msodbcsql18.dll")
+        _logging.getLogger(__name__).debug("main.py: ODBC DLL pre-loaded OK")
+    except (AttributeError, OSError) as _e:
+        _logging.getLogger(__name__).warning("main.py: ODBC DLL pre-load failed (%s)", _e)
+    del _ctypes, _logging
 
 if sys.platform == "win32":
-    import asyncio
+    from i05_asyncio_filter import install_win_connection_reset_filter
 
-    def _install_connection_reset_filter() -> None:
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        def _handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
-            exc = context.get("exception")
-            if isinstance(exc, ConnectionResetError) and "_call_connection_lost" in context.get(
-                "message", ""
-            ):
-                return
-            loop.default_exception_handler(context)
-
-        loop.set_exception_handler(_handler)
-
-    _install_connection_reset_filter()
+    install_win_connection_reset_filter()
 
 import hashlib
 import importlib
@@ -52,6 +47,44 @@ def _aurix_cache_token() -> str:
             parts.append(f"{name}:{path.stat().st_mtime_ns}")
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
+
+def _ui_text(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _is_meaningful_analysis_type(text: str) -> bool:
+    if not text or text.lower() in ("n/a", "none"):
+        return False
+    lowered = text.lower()
+    if "dont change the type" in lowered or "do not change the type" in lowered:
+        return False
+    return True
+
+
+def _thought_process_lines(final_output: dict) -> list[tuple[str, str]]:
+    """Rows for the optional thought-process panel (routing metadata only)."""
+    lines: list[tuple[str, str]] = []
+    analysis_type = _ui_text(final_output.get("analysis_type"))
+    if _is_meaningful_analysis_type(analysis_type):
+        lines.append(("Analysis Type", analysis_type))
+    database_name = _ui_text(final_output.get("database_name"))
+    if database_name and database_name.lower() not in ("n/a", "none"):
+        lines.append(("Database Used", database_name))
+    reasoning = _ui_text(final_output.get("Reasoning"))
+    if reasoning and reasoning.lower() not in ("n/a", "none"):
+        lines.append(("Reasoning", reasoning))
+    return lines
+
+
+def _show_thought_process_panel(final_output: dict) -> bool:
+    """Hide the sidebar when only db_name is set (common when JEV skips routing_agent)."""
+    analysis_type = _ui_text(final_output.get("analysis_type"))
+    reasoning = _ui_text(final_output.get("Reasoning"))
+    return _is_meaningful_analysis_type(analysis_type) or bool(reasoning)
+
+
 st.set_page_config(
     page_title="AURIX – (Affine Unified Retrieval & Intelligence eXecution)",
     layout="wide",
@@ -77,9 +110,14 @@ st.markdown("---")
 def _aurix_core(_cache_token: str):
     import API_unified
     import aurix_core
+    from catalog_runtime import bootstrap_catalog
 
     importlib.reload(API_unified)  # re-read JEV_* and Azure vars from .env
     importlib.reload(aurix_core)
+    try:
+        bootstrap_catalog()
+    except Exception:  # noqa: BLE001
+        pass
     return aurix_core
 
 
@@ -123,7 +161,11 @@ if final_output:
                 "Answer ready — evaluation log could not be saved to Azure SQL (ODBC). Check terminal logs."
             )
 
-        col1, col2 = st.columns([3, 2])
+        show_thought = _show_thought_process_panel(final_output)
+        if show_thought:
+            col1, col2 = st.columns([3, 2])
+        else:
+            col1 = st.container()
 
         with col1:
             st.subheader("📋 Final Answer")
@@ -141,11 +183,13 @@ if final_output:
                     unsafe_allow_html=True,
                 )
 
-        with col2:
-            with st.expander("🤖 **AI Thought Process**", expanded=False):
-                st.markdown(f"**🔧 Analysis Type:** {final_output.get('analysis_type', 'N/A')}")
-                st.markdown(f"**🗃️ Database Used:** {final_output.get('database_name', 'N/A')}")
-                st.markdown(f"**💡 Reasoning:** {final_output.get('Reasoning', 'N/A')}")
+        if show_thought:
+            icons = {"Analysis Type": "🔧", "Database Used": "🗃️", "Reasoning": "💡"}
+            with col2:
+                with st.expander("🤖 **AI Thought Process**", expanded=False):
+                    for label, value in _thought_process_lines(final_output):
+                        icon = icons.get(label, "")
+                        st.markdown(f"**{icon} {label}:** {value}")
 
         st.markdown("---")
 

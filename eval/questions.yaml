@@ -1,0 +1,98 @@
+# Benchmark questions — expected values verified 2026-11-25 via read-only SQL
+# (see .loop/evidence-bench-verify.txt in patch notes / STATE.md)
+version: 1
+questions:
+  - id: sql_dupont_boots_total
+    tags: [sql]
+    question: >
+      In dupoint email data orders, what is the total Total_Amount for
+      Chemical Resistant Boots?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT SUM(Total_Amount) AS metric
+        FROM dupoint_email_data.Orders
+        WHERE Product_Name = N'Chemical Resistant Boots'
+
+  - id: sql_dupont_order_count
+    tags: [sql]
+    question: How many rows are in dupoint email data Orders?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT COUNT(*) AS metric FROM dupoint_email_data.Orders
+
+  - id: sql_hr_headcount
+    tags: [sql]
+    question: How many employee records are in Dummy_data_testing?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT COUNT(*) AS metric FROM Dummy_data_testing
+
+  - id: sql_orders_table_count
+    tags: [sql]
+    question: How many rows are in the orders table?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT COUNT(*) AS metric FROM orders
+
+  - id: sql_dupont_two_products
+    tags: [sql]
+    question: >
+      What is the combined Total_Amount in dupoint email data Orders for
+      Chemical Resistant Boots and Kevlar Gloves?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT SUM(Total_Amount) AS metric
+        FROM dupoint_email_data.Orders
+        WHERE Product_Name IN (N'Chemical Resistant Boots', N'Kevlar Gloves')
+
+  - id: sql_list_heavy
+    tags: [sql, list-heavy]
+    question: List the top 5 product names by total amount in dupoint email data Orders.
+    validation:
+      type: sql_shape
+      min_rows: 1
+      reference_sql: |
+        SELECT TOP 5 Product_Name, SUM(Total_Amount) AS metric
+        FROM dupoint_email_data.Orders
+        GROUP BY Product_Name
+        ORDER BY metric DESC
+
+  - id: semantic_return_policy
+    tags: [semantic]
+    question: What is the return or replacement policy for damaged protective products?
+    validation:
+      type: semantic_grounded
+      min_chunk_overlap: 0.15
+
+  - id: semantic_not_in_docs
+    tags: [semantic, not_in_docs]
+    question: What is the official policy for colonizing Mars in 2099?
+    validation:
+      type: must_not_invent
+      required_phrases:
+        - enough information
+        - no information
+        - not found
+        - cannot
+        - unable
+      match_any: true
+
+  - id: vague_revenue
+    tags: [vague]
+    question: Tell me about revenue.
+    validation:
+      type: vague_ok
+      allow_clarity_block: true
+
+  - id: repeat_dupont_count
+    tags: [sql, repeat]
+    question: How many rows are in dupoint email data Orders?
+    validation:
+      type: sql_reference
+      reference_sql: |
+        SELECT COUNT(*) AS metric FROM dupoint_email_data.Orders

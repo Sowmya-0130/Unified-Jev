@@ -1,0 +1,35 @@
+# Paths/patterns that must NOT be tracked on release branches.
+# Matched against `git ls-files` paths (forward slashes, repo-relative).
+# Comments and blank lines ignored.
+
+# Local / secrets / loop artifacts
+.loop/
+.cursor/
+ISSUES.md
+.cache/
+.env
+*.patch
+**/traces/
+**/logs/
+
+# Diagnostic / probe / verify (dev loop only)
+scripts/i01_*
+scripts/sql_probe.py
+scripts/sql_connection_diff.py
+scripts/jev_smoke_trace.py
+scripts/bench_cache_verify.py
+scripts/s13_kevlar_probe.py
+scripts/verify_*.py
+scripts/a2_token_smoke.py
+scripts/bench.py
+scripts/iter6_token_breakdown.py
+scripts/s7_payload_show.py
+scripts/sql_generator_prompt_inventory.py
+scripts/validator_bench_selftest.py
+scripts/catalog_probe_tables.py
+scripts/catalog_bracket_sample.py
+scripts/print_linked_schema.py
+scripts/ref_sql_values.py
+scripts/latency_budget.py
+scripts/table_name_case.py
+scripts/validate_failed_sql.py

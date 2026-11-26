@@ -47,11 +47,18 @@ def probe_azure_openai_chat(
             timeout=timeout_sec,
             max_retries=0,
         )
-        client.chat.completions.create(
-            model=deployment,
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=1,
-        )
+        _payload = {
+            "model": deployment,
+            "messages": [{"role": "user", "content": "ping"}],
+        }
+        try:
+            client.chat.completions.create(**_payload, max_tokens=1)
+        except Exception as inner:  # noqa: BLE001
+            err_in = str(inner)
+            if "max_completion_tokens" in err_in or "max_tokens" in err_in:
+                client.chat.completions.create(**_payload, max_completion_tokens=16)
+            else:
+                raise
     except Exception as exc:  # noqa: BLE001
         err = str(exc)
         if "401" in err or "403" in err or "Authentication" in type(exc).__name__:

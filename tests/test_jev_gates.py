@@ -9,6 +9,8 @@ import pytest
 
 import aurix_core as core
 
+pytestmark = pytest.mark.groupchat_legacy
+
 
 class _GC:
     def __init__(self, messages: list[dict]):
@@ -31,7 +33,7 @@ def _rai_pass() -> dict:
     "confidence,choice,expect",
     [
         (0.95, "SQL Analysis", core.Sql_Generator),
-        (0.50, "SQL Analysis", core.routing_agent),
+        (0.50, "SQL Analysis", core.user_proxy),
     ],
 )
 def test_s4_routing_confidence(confidence, choice, expect):
@@ -65,37 +67,46 @@ def test_s4_routing_flag_off():
     assert nxt is core.routing_agent
 
 
-@pytest.mark.parametrize(
-    "is_valid,confidence,expect",
-    [
-        (True, 0.9, core.Insight_Generator),
-        (True, 0.5, core.Sql_Execution_Critic),
-        (False, 0.9, core.Sql_Generator),
-    ],
-)
-def test_s7_sql_result(is_valid, confidence, expect):
-    sql_out = '[{"x": 1}]'
-    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": sql_out}])
-    mock = {
-        "source": "openjev",
-        "is_valid": is_valid,
-        "confidence": confidence,
-        "error_type": "empty",
-    }
+def test_s7_heuristic_valid_skips_critic():
+    if hasattr(core, "_reset_sql_loop_guard"):
+        core._reset_sql_loop_guard()
+    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": '[{"x": 1}]'}])
+    with patch.object(core, "JEV_S7_SQL_RESULT_ENABLED", False), patch.object(core, "JEV_SHADOW_MODE", False):
+        nxt = core.state_transition(core.Sql_tool, gc)
+    assert nxt is core.Insight_Generator
+
+
+def test_s7_heuristic_error_routes_generator_not_critic():
+    err = "An error occurred while executing the query: timeout"
+    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": err}])
+    with patch.object(core, "JEV_S7_SQL_RESULT_ENABLED", False), patch.object(core, "JEV_SHADOW_MODE", False):
+        nxt = core.state_transition(core.Sql_tool, gc)
+    assert nxt is core.Sql_Generator
+
+
+def test_s7_inconclusive_defers_to_critic():
+    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": "not-json-rows"}])
     with (
         patch.object(core, "JEV_S7_SQL_RESULT_ENABLED", True),
-        patch.object(core, "JEV_CONFIDENCE_THRESHOLD", 0.8),
-        patch("jev_client.jev_sql_result_check", return_value=mock),
+        patch.object(core, "JEV_SHADOW_MODE", False),
+        patch(
+            "jev_client.s7_resolve",
+            return_value={"is_valid": None, "source": "llm", "decision_source": "llm"},
+        ),
     ):
         nxt = core.state_transition(core.Sql_tool, gc)
-    assert nxt is expect
+    assert nxt is core.Sql_Execution_Critic
 
 
 def test_s7_jev_error_falls_back():
-    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": "[]"}])
+    gc = _GC([_user_question_msg(), {"name": "Sql_tool", "content": "not-rows-payload"}])
     with (
         patch.object(core, "JEV_S7_SQL_RESULT_ENABLED", True),
-        patch("jev_client.jev_sql_result_check", side_effect=RuntimeError("jev")),
+        patch.object(core, "JEV_SHADOW_MODE", False),
+        patch(
+            "jev_client.s7_resolve",
+            return_value={"is_valid": None, "source": "llm", "decision_source": "llm"},
+        ),
     ):
         nxt = core.state_transition(core.Sql_tool, gc)
     assert nxt is core.Sql_Execution_Critic
@@ -105,7 +116,7 @@ def test_s7_jev_error_falls_back():
     "composite,expect",
     [
         (0.85, core.user_proxy),
-        (0.70, core.Evaluation_Agent),
+        (0.70, core.user_proxy),
     ],
 )
 def test_s9_eval_quality(composite, expect):

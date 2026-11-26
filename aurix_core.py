@@ -33,6 +33,101 @@ from sqlalchemy import text
 _AZURE_CHAT_PROBE_DONE = False
 _AZURE_CHAT_PROBE_ERROR: str | None = None
 
+def _reset_sql_loop_guard(request_id: str | None = None) -> None:
+    from request_state import reset_sql_loop_guard
+
+    reset_sql_loop_guard(request_id)
+
+
+def _sql_loop_guard() -> dict:
+    from request_state import sql_loop_guard
+
+    return sql_loop_guard()
+
+
+def _question_for_request(groupchat=None) -> str:
+    from jev_trace import get_request_question
+
+    q = (get_request_question() or "").strip()
+    if q:
+        return q
+    if groupchat is not None and groupchat.messages:
+        return _extract_user_question(groupchat.messages[-1].get("content", "")) or ""
+    return ""
+
+
+def _bind_insight_for_sql(groupchat) -> None:
+    from gate_inputs import latest_sql_tool_result
+    from insight_prompt import build_insight_system_message
+    from jev_trace import get_executed_sqls
+
+    _q = _question_for_request(groupchat)
+    _body, _ = latest_sql_tool_result(groupchat.messages)
+    _ex = (get_executed_sqls() or [""])[-1]
+    Insight_Generator.update_system_message(
+        build_insight_system_message(question=_q, executed_sql=_ex, result_preview=_body or "")
+    )
+
+
+def _return_insight(groupchat):
+    _bind_insight_for_sql(groupchat)
+    return Insight_Generator
+
+
+def _emit_template_insight(groupchat, sql_out: str) -> bool:
+    """Append grounded Insight JSON from SQL rows when template applies; skip Insight LLM."""
+    from answer_template import build_insight_from_sql_result
+    from jev_trace import get_executed_sqls
+
+    executed = (get_executed_sqls() or [""])[-1]
+    payload = build_insight_from_sql_result(sql_out, executed)
+    if not payload:
+        return False
+    from sql_pipeline import validate_insight_schema
+
+    if validate_insight_schema(payload):
+        return False
+    groupchat.messages.append(
+        {
+            "name": "Insight_Generator",
+            "role": "assistant",
+            "content": json.dumps(payload),
+        }
+    )
+    _sql_loop_guard()["insight_done"] = True
+    from jev_trace import event as _jev_event, record_insight_path
+
+    from jev_trace import record_template_insight
+
+    record_insight_path("template")
+    record_template_insight(payload)
+    _jev_event("insight", insight_path="template", skip_llm="Insight_Generator")
+    return True
+
+
+def _advance_after_template_insight(groupchat):
+    groupchat.messages.append(
+        {
+            "name": "evaluation_agent",
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "next_agent": "user_proxy",
+                    "evaluation_status": 1,
+                    "jev_insight": "template",
+                }
+            ),
+        }
+    )
+    return user_proxy
+
+
+def _sql_result_fingerprint(sql_out: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(str(sql_out or "").encode("utf-8", errors="replace")).hexdigest()[:20]
+
+
 _SQL_SCHEMAS = ensure_table_schemas_loaded()
 if AZURE_SQL_WARM_ON_STARTUP:
     if not warm_odbc_connection():
@@ -74,8 +169,26 @@ llm_config = {
         }
     ],
     "temperature": AZURE_LLM_TEMPERATURE,
-    "timeout": AZURE_LLM_REQUEST_TIMEOUT,
+    "timeout": LLM_REQUEST_TIMEOUT_S,
 }
+
+
+def apply_llm_response_cache_setting() -> None:
+    """Sync AutoGen OpenAIWrapper cache with LLM_RESPONSE_CACHE (.env)."""
+    if LLM_RESPONSE_CACHE:
+        llm_config["cache_seed"] = LLM_RESPONSE_CACHE_SEED
+        llm_config.pop("cache", None)
+    else:
+        llm_config["cache_seed"] = None
+        llm_config["cache"] = None
+
+
+def clear_answer_cache() -> None:
+    global _answer_cache
+    _answer_cache.clear()
+
+
+apply_llm_response_cache_setting()
 
 
 client = AzureOpenAI(
@@ -119,87 +232,25 @@ def _extract_user_question(message: str) -> str:
 
 
 def azure_safety_check(question: str) -> dict:
-    """
-    Deterministic safety pre-check (regex) optionally augmented by OpenJev S1.
-    When JEV_S1_SAFETY_ENABLED=true, 3 Noul checks run in one forward pass and
-    their scores are merged into the result. Auto-block if JEV score > 0.85.
-    """
-    text = (question or "").lower()
-    flags = []
+    """Regex + optional JEV S1 (see safety_gate.py); used inside chat when RAI runs."""
+    from safety_gate import build_azure_safety_payload, evaluate_safety, jev_s1_for_question, log_s1_gate
 
-    toxicity_patterns = [
-        r"\b(kill|hate|violence|attack|abuse|harass)\b",
-        r"\b(bomb|weapon|murder|terror)\b",
-    ]
-    toxicity_detected = any(re.search(pattern, text) for pattern in toxicity_patterns)
-    if toxicity_detected:
-        flags.append("toxicity")
-
-    pii_patterns = [
-        r"\b\d{3}-\d{2}-\d{4}\b",
-        r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
-        r"\b(?:ssn|social security number)\b",
-    ]
-    pii_detected = any(re.search(pattern, question or "", re.IGNORECASE) for pattern in pii_patterns)
-    if pii_detected:
-        flags.append("pii")
-
-    injection_patterns = [
-        r"ignore (all )?(previous|prior|above) instructions",
-        r"disregard (the )?(system|developer) (prompt|message|instructions)",
-        r"you are now (?:in )?(?:dan|developer|admin) mode",
-        r"reveal (the )?(system prompt|hidden instructions|api key|secret)",
-        r"jailbreak",
-        r"prompt injection",
-    ]
-    prompt_injection = any(re.search(pattern, text) for pattern in injection_patterns)
-    if prompt_injection:
-        flags.append("prompt_injection")
-
-    if not flags:
-        risk_score = 10
-    elif toxicity_detected or prompt_injection:
-        risk_score = 2
-    elif pii_detected:
-        risk_score = 6
-    else:
-        risk_score = 5
-
-    result = {
-        "toxicity_detected": toxicity_detected,
-        "pii_detected": pii_detected,
-        "prompt_injection": prompt_injection,
-        "flags": flags,
-        "risk_score": risk_score,
-        "azure_safety_result": {
-            "toxicity": "unsafe" if toxicity_detected else "safe",
-            "jailbreak": bool(prompt_injection),
-            "self_harm": False,
-            "pii": "detected" if pii_detected else "none",
-        },
-    }
-
-    # --- S1: OpenJev augmentation (25x faster, 95% cheaper than LLM re-check) ---
+    jev = None
     if JEV_S1_SAFETY_ENABLED:
         try:
-            from jev_client import jev_safety_check as _jev_safe
-            jev = _jev_safe(question)
-            result["jev_safety"] = jev
-            # Override: JEV auto-block overrides regex pass on high confidence
-            if jev.get("block"):
-                result["toxicity_detected"] = result["toxicity_detected"] or jev["is_toxic"] > 0.85
-                result["prompt_injection"]  = result["prompt_injection"]  or jev["is_injection"] > 0.85
-                result["pii_detected"]      = result["pii_detected"]      or jev["has_pii"] > 0.85
-                if "toxicity" not in result["flags"] and jev["is_toxic"] > 0.85:
-                    result["flags"].append("toxicity")
-                if "prompt_injection" not in result["flags"] and jev["is_injection"] > 0.85:
-                    result["flags"].append("prompt_injection")
-                result["risk_score"] = min(result["risk_score"], 2)
-        except Exception as _e:  # noqa: BLE001
-            import logging; logging.getLogger(__name__).warning("JEV S1 safety check failed: %s", _e)
+            from jev_client import jev_last_failure
+            from jev_trace import jev_timed
 
-    return result
+            jev = jev_timed("S1", lambda: jev_s1_for_question(question))
+            if jev.get("source") == "fallback" and jev_last_failure():
+                jev = {**jev, "jev_failure": jev_last_failure()}
+        except Exception as _e:  # noqa: BLE001
+            import logging
+
+            logging.getLogger(__name__).warning("JEV S1 safety check failed: %s", _e)
+    verdict = evaluate_safety(question, jev=jev)
+    log_s1_gate(verdict, question)
+    return build_azure_safety_payload(question, verdict)
 
 
 def evaluation_timestamp_iso() -> str:
@@ -241,7 +292,7 @@ status = "PASS" if composite_score >= 7 else "FAIL"
 
 ## Confidence, timestamp, and blocked_reason
 - Always include `confidence`: `"HIGH"`, `"MEDIUM"`, or `"LOW"` (based on evidence strength and context coverage).
-- Always include `evaluation_timestamp` as ISO 8601 UTC at evaluation time (e.g. `"2026-05-28T14:30:00.000Z"`).
+- Include `evaluation_timestamp` only when provided in the input; do not invent timestamps (server sets them).
 - Include `blocked_reason` **only** when `status` is `"FAIL"`. **Omit** `blocked_reason` on PASS.
 
 ## Dependent / multi-turn questions
@@ -360,7 +411,7 @@ Evaluate the request for:
   },
   "risk_score": 10,
   "severity": "LOW",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "next_agent": "routing_agent"
 }
 
@@ -380,7 +431,7 @@ If blocked (include `blocked_reason`; omit on pass):
   "business_rules": { "violations": [], "assessment": "brief note" },
   "risk_score": 2,
   "severity": "HIGH",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "blocked_reason": "Why the request was blocked",
   "next_agent": "user_proxy",
   "reason": "Why the request was blocked"
@@ -398,72 +449,9 @@ If blocked (include `blocked_reason`; omit on pass):
 
 routing_agent = AssistantAgent(
     name="routing_agent",
-    system_message=f"""
-You are the Routing Agent. Your role is to analyze the user's question and determine whether it should be processed as a SQL query, a semantic search, or a combination of both. Use the provided metadata to guide your decision and distinguish cases where the question may require both SQL and semantic analysis, either dependently or independently.
-
-**Decision-Making Process**:
-
-1. **SQL-based Questions**:
-- If the question directly references fields or columns from the metadata (e.g., city_name, population, country) or follows a query-like structure, classify it as SQL-based.
-
-2. **Semantic Questions**:
-- If the question is abstract, general, or does not reference specific fields or columns from the metadata, classify it as a semantic question.
-
-3. **Both-Dependent**:
-- If the second part of the question depends on information from the first part, classify it as "both-dependent."
-- Example: "Which country has the highest GDP and what are the key features?" Here, the second part depends on identifying the country with the highest GDP first.
-- This requires a SQL query to find the country, followed by a semantic search to retrieve key features based on that result.
-
-4. **Both-Independent**:
-- If both parts of the question can be addressed independently, classify it as "both-independent."
-- Example: "Which country has the highest GDP rate and what are the key features of Indian GDP?" Here, each part can be answered separately, as the second part does not depend on the first.
-- In this implementation, handle them sequentially: first the SQL-based part, then the semantic part.
-
-**Meta_Data**:
-{_SQL_SCHEMAS}
-
-**Routing Instructions**:
-- For SQL-based questions, pass them to the Sql_Generator.
-- For semantic questions, pass them to the Eryl_agent.
-- For both-dependent questions, start with SQL to get the necessary context, then proceed with a refined semantic search.
-- For both-independent questions, pass the question to both the Sql_Generator and Eryl_agent simultaneously.
-
-**Output Format in Strictly JSON Format**:
-
-For SQL-based analysis:
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "SQL-based",
-"next_agent": "Sql_Generator",
-"next_step": "Proceed with SQL-based query"
-}}
-
-For Semantic-based analysis:
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "Semantic-based",
-"next_agent": "Eryl_agent",
-"next_step": "Proceed with semantic  search"
-}}
-
-For Both-Dependent analysis:
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "Both-dependent",
-"next_agent": "Sql_Generator",
-"next_step": "Start with SQL-based query and refine with semantic search based on SQL results"
-}}
-
-For Both-Independent analysis:
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "Both-independent",
-"next_agent": "Sql_Generator",
-"next_step": "Execute SQL, then semantic search independently (sequentially)"
-}}
-
-**Your Objective**:
-    - Correctly analyze the user's question based on the metadata and determine the most appropriate approach, selecting the proper agent(s) for handling the request.
+    system_message="""
+You are routing_agent. JSON only. Classify the user question: SQL-based, Semantic-based, Both-dependent, or Both-independent.
+Output keys: initial_question, analysis_type, next_agent (Sql_Generator or Eryl_agent), next_step (short). No schema dump.
 """,
     max_consecutive_auto_reply=3,
     llm_config=llm_config,
@@ -471,69 +459,11 @@ For Both-Independent analysis:
 )
 
 # Quin Flow
+from sql_generator_prompt import SQL_GENERATOR_BASE
+
 Sql_Generator = AssistantAgent(
     name="Sql_Generator",
-    system_message=f"""
-You are the Sql_Generator Agent. Your role is to use the provided metadata to analyze SQL-based questions and generate a valid SQL query to fetch the required information from the database. Ensure the query is accurate and valid according to the table schema. Once formed, return the query.
-
-**READ-ONLY (mandatory)**: Generate **SELECT or WITH … SELECT only**. Never INSERT, UPDATE, DELETE, DROP, ALTER, EXEC, or any data-modifying SQL.
-
-**Steps**:
-1. **Parse the Question**:
-- Analyze the user's question and identify the relevant fields based on the metadata.
-
-2. **Meta_Data**:
-    {_SQL_SCHEMAS}
-
-Form the SQL Query:
-    1. Based on the identified fields, construct a valid SQL query.
-    2. Ensure that the query matches the metadata schema (i.e., use the correct column names and data types).
-    3. Use TOP instead of LIMIT.
-
-Example:
-For a question like "Which city has the largest population?", the expected SQL query would be:
-SELECT TOP 1 city_name, population FROM city_stats ORDER BY population DESC;
-Handle Invalid Queries:
-
-If the question references fields not available in the metadata, or if it's impossible to form a valid SQL query, return:
-
-sql_query: None
-sql_question: separate the SQL-based question from the initial question.
-Return the Output in strictly json format.
-    Once a valid SQL query is generated, return the result in the specified format.
-    If no valid query can be formed, return None for the sql_query field.
-
-# Output Format strictly json format.
-For valid SQL queries:
-
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "Dont change the type,keep the same selected by routing agent",
-"sql_question": "sql question",
-"sql_query": "SQL query",
-"db_name": "SQL",
-"next_agent": "Query_Executor"
-}}
-
-For invalid queries (no matching metadata):
-{{
-"initial_question": "Original question from the user",
-"analysis_type": "Dont change the type,keep the same selected by routing agent",
-"sql_question": "sql question",
-"sql_query": None,
-"db_name": "SQL",
-"next_agent": "Query_Executor"
-}}
-
-Your Objective:
-    Ensure that all SQL queries generated are valid according to the provided metadata.
-    Return the appropriate query or an error message if no valid SQL query can be formed.
-    pass the query to Query_Executor to get the result.
-⚠️ **Important**:  
-    ✅ **You must always return the output in a strict JSON format as specified below.**  
-    ❌ **Never return plain text or explanations in natural language.**  
-    ❌ **Never describe the next steps in text; return them in JSON format only.**  
-""",
+    system_message=SQL_GENERATOR_BASE + "\n(Schema linked at request time.)\n",
 max_consecutive_auto_reply=3,
     llm_config=llm_config,
     human_input_mode="NEVER"
@@ -647,122 +577,14 @@ description="An expert SQL critic that evaluates the result or errors coming fro
 
 
 
+from insight_prompt import INSIGHT_BASE
+
 Insight_Generator = AssistantAgent(
     name="Insight_Generator",
-    system_message="""
-1.1 Formulate a Direct Answer:
-
-    Based on the query and the output from the DB tool, provide a precise and professional response.
-    Ensure that the answer accurately represents the data retrieved by the query.
-    Keep the response clear and structured, without unnecessary elaboration or assumptions beyond the query results.
-    Always include numerical values if present in the query results.
-    Present numerical summaries or counts to enhance clarity.
-
-Example:
-    Instead of: "The shipment statuses for the last 15 entries are as follows: In Transit, Delivered, Delivered, Delayed, Delayed, Delivered, Delayed, Delivered, Delivered, Delivered, Delivered, In Transit, In Transit, Delivered, In Transit."
-    Provide: "Out of the last 15 shipments, the statuses are: Delivered (7), In Transit (4), and Delayed (4)."
-
-1.2 Inference:
-
-    Analyze the output logically and provide a brief, data-driven inference.
-    Highlight key insights, patterns, or anomalies that can be drawn from the results.
-    Maintain a neutral and professional tone, avoiding speculation beyond the given data.
-
-Example:
-    "The data indicates that 47% of recent shipments were successfully delivered, while 27% are still in transit and 27% faced delays. This suggests potential logistical challenges affecting timely deliveries."
-
-2.1 Generate Python Code for Visualization:
-    Select the Appropriate Chart Type:
-    Choose the most suitable chart based on the query result.
-    For categorical data: Use bar charts.
-    For time-series or sequential data: Use line graphs.
-    For correlations between two numerical variables: Use scatter plots.
-    If the SQL query results cannot be visualized (e.g., no data or unsuited for visualization), return "None".
-
-2.2 Chart Customization:
-    Use Seaborn for better aesthetics and clarity.
-    Different categories should have different colors based on insights.
-    Display numerical values above each bar for clarity.
-    Ensure charts are aligned and formatted for clarity.
-    Avoid chart element overlaps (labels, bars, points).
-    Use professional chart design principles (clean, readable, and visually appealing).
-
-2.3 **Labeling & Titles**:
-    **The X-axis should always represent categories.**
-    **The Y-axis should always represent counts or numerical values.**
-    Titles should clearly reflect the data being presented.
-    Add legends when appropriate to aid in understanding multiple data sets.
-
-Execution:
-    The script should be error-free and ready to execute directly.
-    Ensure charts effectively visualize the  query results.
-
-3. Task: Validate the Answer for Query Question Based on Key Parameters
-After generating the answer, validate it using the following parameters, scoring each from 0 to 10:
-
-    Helpfulness: How useful is the answer in addressing the question? Does it offer practical, actionable advice?
-    Relevance: How closely does the answer align with the specific question?
-    Level of Detail: Is the answer sufficiently detailed to be informative?
-    Groundedness: Is the answer based on factual and reliable information from the provided context?
-    Completeness: Does the answer fully address the question?
-    Faithfulness: Does the answer accurately reflect the provided information?
-
-**STRICTLY FOLLOW THE OUTPUT JSON FORMAT GIVEN BELOW**:
-
-**Example Output 1**:
-{
-  "initial_question": "Which city has the largest GDP?",
-  "analysis_type": "Don't change the type, keep the same selected by routing agent",
-  "db_name": "SQL", 
-  "query_question": "sql question",
-  "query": "SELECT city_name, GDP FROM city_stats ORDER BY GDP DESC LIMIT 1;",
-  "query_answer": "The city with the largest GDP is Tokyo, with a GDP of approximately 1.5 trillion USD.",
-  "Inference":"Detailed Inference",
-  "scores": {
-            "Helpfulness": X,
-            "Relevance": Y,
-            "Level of Detail": Z,
-            "Groundedness": A,
-            "Completeness": B,
-            "Faithfulness": E
-        },
-  "feedback":"feedback explaintion",
-  "python_code": "Return "None" only if no python code",
-  "code_explaination":"Return "None" only if no python code"
-}
-
-**Example Output 2**:
-{
-  "initial_question": "What is the distribution of average temperatures in each city for the last 7 days?",
-  "analysis_type": "Don't change the type, keep the same selected by routing agent",
-  "db_name": "SQL", 
-  "query_question": "What is the average temperature in each city for the last 7 days?",
-  "query_query": "SELECT city_name, AVG(temperature) as avg_temperature FROM city_weather WHERE date >= NOW() - INTERVAL 7 DAY GROUP BY city_name;",
-  "query_answer": "The average temperatures of the cities for the last 7 days are: Tokyo (15°C), New York (8°C), Los Angeles (20°C), London (10°C), and Paris (12°C).",
-  "Inference":"Detailed Inference",
-  "query_scores": {
-            "Helpfulness": X,
-            "Relevance": Y,
-            "Level of Detail": Z,
-            "Groundedness": A,
-            "Completeness": B,
-            "Faithfulness": E
-        },
-  "feedback":"feedback explaintion",
-  "python_code": "import matplotlib.pyplot as plt\nimport pandas as pd\n\ndata = {\n    'City': ['Tokyo', 'New York', 'Los Angeles', 'London', 'Paris'],\n    'Avg Temperature (°C)': [15, 8, 20, 10, 12]\n}\ndf = pd.DataFrame(data)\n\nplt.figure(figsize=(10, 6))\nplt.barh(df['City'], df['Avg Temperature (°C)'], color='skyblue')\nplt.title('Average Temperature for the Last 7 Days by City')\nplt.xlabel('Average Temperature (°C)')\nplt.ylabel('City')\nplt.tight_layout()\nplt.show()",
-  "code_explaination":"Code Explaination"
-  }
-NOTE:
-**if there is no feedback everything is correct and all the scores are more than or equal to 8 then give as "Happy with the result.".
-
-⚠️ **Important**:  
-    ✅ **You must always return the output in a strict JSON format as specified below.**  
-    ❌ **Never return plain text or explanations in natural language.**  
-    ❌ **Never describe the next steps in text; return them in JSON format only.**  
-""",
-max_consecutive_auto_reply=6,
+    system_message=INSIGHT_BASE + "\n(Context bound per request.)\n",
+    max_consecutive_auto_reply=3,
     llm_config=llm_config,
-    human_input_mode="NEVER"
+    human_input_mode="NEVER",
 )
 
 Evaluation_Agent = AssistantAgent(
@@ -830,7 +652,7 @@ Apply the rubric to the **generated answer** (query_answer + inference), not onl
   "composite_score": 8.7,
   "status": "PASS",
   "confidence": "HIGH",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "feedback": "<summary of evaluation outcome>",
   "reasoning": "<why complete or what is missing>",
   "updated_question": "None",
@@ -846,7 +668,7 @@ FAIL example — missing SQL (include `blocked_reason`; omit on PASS):
   "composite_score": 5.8,
   "status": "FAIL",
   "confidence": "LOW",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "blocked_reason": "Answer missing required structured data from SQL",
   "updated_question": "<missing SQL sub-question>",
   "next_agent": "Sql_Generator",
@@ -1060,7 +882,7 @@ When `analysis_type` is dependent or prior turns exist: use **initial_question**
   "composite_score": 8.7,
   "status": "PASS",
   "confidence": "HIGH",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "feedback_query": "None",
   "feedback_detail": "None"
 }}
@@ -1072,7 +894,7 @@ FAIL example (include `blocked_reason`; omit on PASS):
   ...
   "status": "FAIL",
   "confidence": "LOW",
-  "evaluation_timestamp": "2026-05-28T14:30:00.000Z",
+  "evaluation_timestamp": "<server-injected>",
   "blocked_reason": "Answer not grounded in retrieved context",
   "feedback_query": "<focused follow-up>",
   "feedback_detail": "<gap explanation>"
@@ -1190,13 +1012,12 @@ async def extract_context(question: str = None, vector_weight: float = 0.5, grap
 def db_execute_query(query: str = None, db_name: str = None) -> str:
     import time as _time
 
-    from jev_trace import record_step, reset_sql_attempts, take_sql_attempts
+    from jev_trace import bump_sql_attempt, record_step, take_sql_attempts
 
     if db_name != "SQL":
         return "Invalid database name provided. Please use 'SQL'."
 
     _db_t0 = _time.perf_counter()
-    reset_sql_attempts()
     _out: str = ""
 
     try:
@@ -1226,6 +1047,8 @@ def db_execute_query(query: str = None, db_name: str = None) -> str:
                 import logging; logging.getLogger(__name__).warning("JEV S6 sql guard failed: %s", _e)
 
         from metadata import fetch_dataframe_readonly, run_sql_with_retry
+        from sql_catalog import get_catalog_readonly
+        from sql_pipeline import record_three_part_execution_attempt, validate_sql
         from sql_safety import assert_readonly_sql
 
         if not SQL_AGENT_READ_ONLY:
@@ -1238,20 +1061,60 @@ def db_execute_query(query: str = None, db_name: str = None) -> str:
             _out = f"Query blocked (read-only policy): {block}"
             return _out
 
+        from jev_trace import get_request_question
+
+        _vr = validate_sql(query, get_catalog_readonly(), question=get_request_question() or None)
+        if not _vr.ok:
+            return _vr.error_payload()
+        query = _vr.normalized_sql or query
+        record_three_part_execution_attempt(query)
+        from jev_trace import record_executed_sql
+
+        record_executed_sql(query)
+
+        from API_unified import AZURE_SQL_ODBC_RETRIES
+        from jev_trace import get_request_question, record_match_row_count
+        from question_time import parse_time_window
+        from sql_match_count import build_filter_count_sql
+
+        _rq = get_request_question()
+        if parse_time_window(_rq or ""):
+            _csql = build_filter_count_sql(query)
+            if _csql:
+                _cvr = validate_sql(_csql, get_catalog_readonly(), question=_rq or None)
+                if _cvr.ok:
+                    try:
+                        _crow = fetch_dataframe_readonly(_cvr.normalized_sql or _csql)
+                        _mcc = int(_crow.iloc[0, 0]) if not _crow.empty else 0
+                        record_match_row_count(_mcc)
+                        if _mcc == 0:
+                            bump_sql_attempt()
+                            _out = "[]"
+                            return _out
+                    except Exception:  # noqa: BLE001
+                        pass
+
         def _run() -> str:
             return fetch_dataframe_readonly(query).to_json(orient="records")
 
-        from API_unified import AZURE_SQL_ODBC_RETRIES
-
         _out = run_sql_with_retry(_run, attempts=AZURE_SQL_ODBC_RETRIES)
+        bump_sql_attempt()
+        return _out
+    except TimeoutError as te:
+        _out = str(te)
         return _out
     except Exception as e:
         err = str(e)
         if "40515" in err or "dbo." in (query or ""):
-            err = (
-                f"{err} — Hint: use [Schema].[Table] (e.g. [Updated_email_dupoint].[Orders]), "
-                "not dbo.Schema.Table."
-            )
+            try:
+                from sql_catalog import get_catalog_readonly
+
+                err = (
+                    f"{err} — Use canonical [schema].[table]. "
+                    f"Candidates: {get_catalog_readonly().all_bracketed_names()[:8]}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
         _out = f"An error occurred while executing the query: {err}"
         return _out
     finally:
@@ -1267,19 +1130,40 @@ def db_execute_query(query: str = None, db_name: str = None) -> str:
 
 
 
+def _jev_gate_fallback(jev: dict, *, confident: bool) -> str | None:
+    from jev_client import jev_last_failure
+
+    if confident:
+        return None
+    if jev.get("source") == "fallback":
+        return jev_last_failure() or "error"
+    return "low_conf"
+
+
+def _agent_name(agent) -> str:
+    return str(getattr(agent, "name", None) or agent)
+
+
 def state_transition(last_speaker, groupchat):
     from jev_trace import mark_agent_transition
 
     mark_agent_transition(last_speaker)
+    _spk = _agent_name(last_speaker)
     messages = groupchat.messages
     last_message = messages[-1]["content"]
     
-    if last_speaker is user_proxy:
+    if _spk == "user_proxy":
         question = _extract_user_question(last_message)
-        from jev_trace import setup_step
+        from request_state import safety_prechat_blob, safety_skip_rai_llm
 
-        with setup_step("azure_content_safety"):
-            safety_result = azure_safety_check(question)
+        pre = safety_prechat_blob()
+        if pre:
+            safety_result = pre
+        else:
+            from jev_trace import setup_step
+
+            with setup_step("azure_content_safety"):
+                safety_result = azure_safety_check(question)
         groupchat.messages.append({
             "name": "azure_safety_check",
             "role": "assistant",
@@ -1292,25 +1176,150 @@ def state_transition(last_speaker, groupchat):
                 indent=2,
             ),
         })
-        return Responsible_AI_Agent
+        from API_unified import SAFETY_LLM_MODE
+
+        if SAFETY_LLM_MODE == "off" or safety_skip_rai_llm():
+            from jev_trace import event as _jev_event
+            from request_state import jev_route_next_agent
+            from routing_s4 import append_synthetic_routing, preflight_s4
+
+            _jev_event("S1", decision="pass", skip_llm="Responsible_AI_Agent", source="jev_s1_only")
+            _next = jev_route_next_agent()
+            _route = None
+            if not _next:
+                _pf = preflight_s4(question, schema_summary=SQL_Meta_Data)
+                if _pf.handled:
+                    from jev_trace import record_termination
+
+                    record_termination("s4_both_preflight_unexpected_in_chat")
+                    return user_proxy
+                _next = _pf.next_agent or "Sql_Generator"
+                append_synthetic_routing(groupchat, question, _pf)
+            else:
+                from request_state import jev_route_choice
+                from routing_s4 import S4Preflight
+
+                append_synthetic_routing(
+                    groupchat,
+                    question,
+                    S4Preflight(handled=False, route=jev_route_choice(), next_agent=_next, jev={}),
+                )
+            if _next == "Sql_Generator":
+                return Sql_Generator
+            if _next == "Eryl_agent":
+                return Eryl_agent
+            from API_unified import ROUTING_LLM_FALLBACK
+
+            if not ROUTING_LLM_FALLBACK:
+                return Sql_Generator
+            return routing_agent
+        from API_unified import RAI_LLM_FALLBACK
+
+        if RAI_LLM_FALLBACK and SAFETY_LLM_MODE != "off":
+            return Responsible_AI_Agent
+        from routing_s4 import append_synthetic_routing, preflight_s4
+
+        _pf = preflight_s4(question, schema_summary=SQL_Meta_Data)
+        if _pf.handled and _pf.finish_response:
+            groupchat.messages.append({
+                "name": "user_proxy",
+                "role": "assistant",
+                "content": json.dumps({"flow_preflight_finish": True}),
+            })
+            return user_proxy
+        append_synthetic_routing(groupchat, question, _pf)
+        return Sql_Generator if _pf.next_agent == "Sql_Generator" else Eryl_agent
 
     elif last_speaker is Responsible_AI_Agent:
         parsed_content = parsed_last_message(last_message=last_message)
+        if JEV_SHADOW_MODE and JEV_S1_SAFETY_ENABLED:
+            try:
+                from jev_trace import log_gate_decision
+
+                _safety_blob = next(
+                    (m for m in groupchat.messages if m.get("name") == "azure_safety_check"),
+                    None,
+                )
+                _jev_s1 = {}
+                if _safety_blob:
+                    _jev_s1 = json.loads(_safety_blob.get("content", "{}")).get(
+                        "azure_content_safety", {}
+                    ).get("jev_safety", {})
+                _rai_pass = bool(parsed_content.get("rai_check_passed"))
+                log_gate_decision(
+                    "S1",
+                    input_summary={"question_len": len(_question_for_request(groupchat) or "")},
+                    decision=f"rai_pass={_rai_pass}",
+                    confidence=float(_jev_s1.get("is_toxic") or 0),
+                    threshold=0.85,
+                    action="block" if not _rai_pass else "pass",
+                    shadow_jev_would="block" if _jev_s1.get("block") else "pass",
+                    jev_block=bool(_jev_s1.get("block")),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if not parsed_content.get("rai_check_passed"):
+            _q_rai = _question_for_request(groupchat)
+            _safety_blob = next(
+                (m for m in groupchat.messages if m.get("name") == "azure_safety_check"),
+                None,
+            )
+            _safe_doc: dict = {}
+            if _safety_blob:
+                try:
+                    _safe_doc = json.loads(str(_safety_blob.get("content") or "{}"))
+                except json.JSONDecodeError:
+                    _safe_doc = {}
+            from rai_route_heuristic import should_allow_routing_despite_rai_block
+
+            if should_allow_routing_despite_rai_block(_q_rai, _safe_doc):
+                from jev_trace import event as _jev_event
+
+                _jev_event("S1", rai_override="heuristic_sql_analytics", decision="pass")
+                parsed_content = {
+                    **parsed_content,
+                    "rai_check_passed": True,
+                    "next_agent": "routing_agent",
+                }
         if parsed_content.get("rai_check_passed") and parsed_content.get("next_agent") == "routing_agent":
             # --- OpenJev fast routing (enabled via JEV_ROUTING_ENABLED=true in .env) ---
             if JEV_ROUTING_ENABLED:
                 try:
                     from jev_client import jev_routing_decision
-                    from jev_trace import jev_timed
+                    from jev_trace import event as _jev_event, jev_timed, log_gate_decision
 
-                    _q = _extract_user_question(groupchat.messages[0]["content"])
-                    _jev = jev_timed(
-                        "S4",
-                        lambda: jev_routing_decision(_q, SQL_Meta_Data),
+                    _q = _question_for_request(groupchat)
+                    from dual_route import merge_openjev_route, next_agent_for_route
+
+                    _jev = merge_openjev_route(
+                        _q,
+                        jev_timed(
+                            "S4",
+                            lambda: jev_routing_decision(_q, SQL_Meta_Data),
+                        ),
                     )
-                    if _jev["confidence"] >= JEV_CONFIDENCE_THRESHOLD and _jev["choice"]:
-                        from jev_trace import event as _jev_event
-
+                    _would_skip = bool(
+                        _jev.get("source") == "openjev"
+                        and _jev["confidence"] >= JEV_CONFIDENCE_THRESHOLD
+                        and _jev.get("choice")
+                    )
+                    log_gate_decision(
+                        "S4",
+                        input_summary={
+                            "question_len": len(_q or ""),
+                            "schema_chars": len(SQL_Meta_Data or ""),
+                        },
+                        decision=_jev.get("choice"),
+                        confidence=_jev.get("confidence"),
+                        threshold=JEV_CONFIDENCE_THRESHOLD,
+                        action="run_llm" if JEV_SHADOW_MODE or not _would_skip else "skip_llm",
+                        fallback_reason=_jev_gate_fallback(
+                            _jev,
+                            confident=_would_skip and not JEV_SHADOW_MODE,
+                        ),
+                        shadow_jev_would="skip_llm" if JEV_SHADOW_MODE and _would_skip else None,
+                    )
+                    if _would_skip and not JEV_SHADOW_MODE:
                         _jev_event(
                             "S4",
                             decision="route",
@@ -1319,7 +1328,9 @@ def state_transition(last_speaker, groupchat):
                             skip_llm="routing_agent",
                         )
                         _route = _jev["choice"]
-                        _next_ag = "Sql_Generator" if "SQL" in _route else "Eryl_agent"
+                        _next_ag = next_agent_for_route(_route or "")
+                        if _next_ag == "Both_handler":
+                            _next_ag = "Eryl_agent"
                         groupchat.messages.append({
                             "name": "routing_agent",
                             "role": "assistant",
@@ -1337,77 +1348,224 @@ def state_transition(last_speaker, groupchat):
                             }),
                         })
                         return Sql_Generator if _next_ag == "Sql_Generator" else Eryl_agent
-                    # low confidence — fall through to Azure LLM routing_agent
                 except Exception as _e:  # noqa: BLE001
                     import logging
                     logging.getLogger(__name__).warning(
                         "OpenJev routing failed (%s); falling back to Azure LLM.", _e
                     )
-            # --- Default: Azure LLM routing_agent ---
-            return routing_agent
+            from API_unified import ROUTING_LLM_FALLBACK
+
+            if ROUTING_LLM_FALLBACK:
+                return routing_agent
+            from routing_s4 import append_synthetic_routing, preflight_s4
+
+            _pf = preflight_s4(_question_for_request(groupchat), schema_summary=SQL_Meta_Data)
+            if _pf.handled:
+                return user_proxy
+            append_synthetic_routing(groupchat, _question_for_request(groupchat), _pf)
+            return Sql_Generator if _pf.next_agent == "Sql_Generator" else Eryl_agent
         return user_proxy
       
     elif last_speaker is routing_agent:
         parsed_content = parsed_last_message(last_message=last_message)
+        from dual_route import coerce_sql_only_route
+
+        _q_route = _question_for_request(groupchat)
+        _coerced = coerce_sql_only_route(
+            _q_route, str(parsed_content.get("analysis_type") or "")
+        )
+        if _coerced:
+            parsed_content = {
+                **parsed_content,
+                "analysis_type": _coerced,
+                "next_agent": "Sql_Generator",
+            }
+            last_message = json.dumps(parsed_content)
+            groupchat.messages[-1] = {
+                **groupchat.messages[-1],
+                "content": last_message,
+            }
         next_agent = parsed_content.get("next_agent", "")
         if next_agent in ("Sql_Generator"):
             return Sql_Generator
         elif next_agent == "Eryl_agent":
             return Eryl_agent
 
-    elif last_speaker is Sql_Generator:
-        return Query_Executor
+    elif _spk == "Sql_Generator":
+        from sql_execute_step import (
+            append_sql_tool_message,
+            parse_sql_generator_query,
+            run_validated_sql,
+            validation_error_body,
+        )
+
+        _q = parse_sql_generator_query(last_message)
+        _body: str
+        _qtext = _question_for_request(groupchat)
+        _to_run, _ = run_validated_sql(_q, question=_qtext)
+        if _to_run:
+            _body = db_execute_query(query=_to_run, db_name="SQL")
+        else:
+            from sql_repair_recovery import try_time_window_zero_from_generator_sql
+
+            _mrc = try_time_window_zero_from_generator_sql(groupchat)
+            if _mrc == 0 and _emit_template_insight(groupchat, "[]"):
+                from jev_trace import record_termination
+
+                record_termination("sql_validation_recovery_empty", attempts=0)
+                return _advance_after_template_insight(groupchat)
+            _body = validation_error_body(_q, question=_qtext)
+        append_sql_tool_message(groupchat, _body)
+        return state_transition(Sql_tool, groupchat)
 
     elif last_speaker is Query_Executor:
         return Sql_tool
+    elif _spk == "Sql_tool":
+        from gate_inputs import latest_sql_tool_result, s7_input
+        from jev_client import s7_resolve
+        from jev_trace import event as _jev_event, jev_timed, log_gate_decision
 
-    elif last_speaker is Sql_tool:
-        # --- S7: OpenJev fast SQL result check (27x faster, 95% cheaper) ---
-        if JEV_S7_SQL_RESULT_ENABLED:
+        _sql_out, _sql_tool_idx = latest_sql_tool_result(messages)
+        if not _sql_out:
+            return Sql_tool
+        if "sql_pipeline_error" in str(_sql_out) or (
+            str(_sql_out).strip().startswith("{") and '"sql_pipeline_error"' in str(_sql_out)
+        ):
+            from sql_repair_recovery import try_time_window_zero_from_generator_sql
+
+            _mrc_early = try_time_window_zero_from_generator_sql(groupchat)
+            if _mrc_early == 0 and _emit_template_insight(groupchat, "[]"):
+                from jev_trace import record_termination
+
+                record_termination("sql_validation_recovery_empty", attempts=0)
+                return _advance_after_template_insight(groupchat)
+            _fb = "Fix the SQL and retry."
             try:
-                from jev_client import jev_sql_result_check
-                from jev_trace import jev_timed
+                _err = json.loads(_sql_out)
+                _fb = (
+                    f"SQL validation failed ({_err.get('class')}): {_err.get('message')}. "
+                    "Return one aggregate (SUM/COUNT) over the filtered rows — no UNION, "
+                    "no GROUP BY breakdown, no CROSS JOIN."
+                )
+            except json.JSONDecodeError:
+                _fb = str(_sql_out)[:240]
+            from jev_trace import record_termination, take_sql_attempts
+            from request_state import bump_validation_repair, take_validation_repairs
 
-                _sql_out = last_message
-                _rcheck = jev_timed("S7", lambda: jev_sql_result_check(_sql_out))
-                if _rcheck["source"] == "openjev":
-                    from jev_trace import event as _jev_event
+            bump_validation_repair()
+            if take_validation_repairs() >= SQL_MAX_REPAIR_ROUNDS:
+                from sql_repair_recovery import try_time_window_zero_from_generator_sql
 
-                    if _rcheck["is_valid"] and _rcheck.get("confidence", 0) >= JEV_CONFIDENCE_THRESHOLD:
-                        _jev_event(
-                            "S7",
-                            decision="pass",
-                            confidence=_rcheck.get("confidence"),
-                            skip_llm="Sql_Execution_Critic",
-                        )
-                        # Inject synthetic Sql_Execution_Critic PASS → go straight to Insight_Generator
-                        groupchat.messages.append({
-                            "name": "Sql_Execution_Critic",
-                            "role": "assistant",
-                            "content": json.dumps({
-                                "next_agent": "Insight_Generator",
-                                "feedback": "Happy with the result",
-                                "db_name": "SQL",
-                                "jev_s7": f"PASS confidence={_rcheck['confidence']:.2f}",
-                            }),
-                        })
-                        return Insight_Generator
-                    elif not _rcheck["is_valid"]:
-                        # Inject FAIL with error type → retry Sql_Generator
-                        groupchat.messages.append({
-                            "name": "Sql_Execution_Critic",
-                            "role": "assistant",
-                            "content": json.dumps({
-                                "next_agent": "Sql_Generator",
-                                "feedback": f"SQL execution failed: {_rcheck['error_type']}",
-                                "db_name": "SQL",
-                                "jev_s7": f"FAIL error_type={_rcheck['error_type']}",
-                            }),
-                        })
-                        return Sql_Generator
-                    # else: low confidence — fall through to Sql_Execution_Critic LLM
-            except Exception as _e:  # noqa: BLE001
-                import logging; logging.getLogger(__name__).warning("JEV S7 result check failed: %s", _e)
+                _mrc = try_time_window_zero_from_generator_sql(groupchat)
+                if _mrc == 0 and _emit_template_insight(groupchat, "[]"):
+                    record_termination(
+                        "sql_validation_recovery_empty",
+                        attempts=take_validation_repairs(),
+                    )
+                    return _advance_after_template_insight(groupchat)
+                record_termination("sql_max_repair_rounds", attempts=take_validation_repairs())
+                return Insight_Generator
+            groupchat.messages.append(
+                {
+                    "name": "Sql_Execution_Critic",
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {
+                            "next_agent": "Sql_Generator",
+                            "feedback": _fb,
+                            "db_name": "SQL",
+                        }
+                    ),
+                }
+            )
+            return Sql_Generator
+        _fp = _sql_result_fingerprint(_sql_out)
+        _s7_in = s7_input(_sql_out, message_index=_sql_tool_idx)
+
+        def _run_s7():
+            return s7_resolve(_sql_out, jev_enabled=JEV_S7_SQL_RESULT_ENABLED)
+
+        _rcheck = (
+            jev_timed("S7", _run_s7)
+            if JEV_S7_SQL_RESULT_ENABLED
+            else _run_s7()
+        )
+        from jev_trace import get_match_row_count
+
+        _mrc = get_match_row_count()
+        if _mrc is not None and _mrc == 0:
+            _rcheck = {
+                **_rcheck,
+                "is_valid": False,
+                "no_matching_data": True,
+                "error_type": "empty_result",
+                "match_row_count": 0,
+                "confidence": max(float(_rcheck.get("confidence") or 0), 0.92),
+                "source": "heuristic",
+                "decision_source": "heuristic",
+            }
+        _src = _rcheck.get("decision_source") or _rcheck.get("source") or "llm"
+        _valid = bool(_rcheck.get("is_valid"))
+        _no_data = bool(_rcheck.get("no_matching_data"))
+        _resolved = _src in ("heuristic", "jev")
+        _skip_critic = _valid or (_no_data and _src != "llm") or (
+            _resolved and _rcheck.get("is_valid") is False
+        )
+        log_gate_decision(
+            "S7",
+            input_summary=_s7_in,
+            decision="pass" if _valid else ("no_data" if _no_data else "fail"),
+            confidence=_rcheck.get("confidence"),
+            threshold=JEV_CONFIDENCE_THRESHOLD,
+            action="run_llm" if JEV_SHADOW_MODE or not _skip_critic else "skip_llm",
+            decision_source=_src,
+            fallback_reason=None if _skip_critic else _jev_gate_fallback(_rcheck, confident=False),
+        )
+        from request_state import guard_matches_current_request
+
+        if _valid and guard_matches_current_request():
+            _sql_loop_guard()["result_fp"] = _fp
+            _sql_loop_guard()["valid"] = True
+        if (
+            guard_matches_current_request()
+            and _sql_loop_guard()["valid"]
+            and _sql_loop_guard()["result_fp"] == _fp
+            and _sql_loop_guard()["insight_done"]
+        ):
+            return Evaluation_Agent
+        if (
+            guard_matches_current_request()
+            and _sql_loop_guard()["valid"]
+            and _sql_loop_guard()["result_fp"] == _fp
+        ):
+            return _return_insight(groupchat)
+        if _skip_critic and not JEV_SHADOW_MODE:
+            from API_unified import SQL_S7_LLM_FALLBACK
+
+            if _valid:
+                _jev_event("S7", decision="pass", skip_llm="Sql_Execution_Critic", decision_source=_src)
+                if _emit_template_insight(groupchat, _sql_out):
+                    return _advance_after_template_insight(groupchat)
+                return _return_insight(groupchat)
+            if _no_data:
+                if _emit_template_insight(groupchat, "[]"):
+                    return _advance_after_template_insight(groupchat)
+                return _return_insight(groupchat)
+            if not _rcheck.get("is_valid") and _src in ("heuristic", "jev") and not SQL_S7_LLM_FALLBACK:
+                return Sql_Generator
+        log_gate_decision(
+            "S7",
+            input_summary=_s7_in,
+            decision="defer",
+            action="run_llm",
+            decision_source="llm",
+        )
+        from API_unified import SQL_S7_LLM_FALLBACK
+
+        if not SQL_S7_LLM_FALLBACK and not JEV_SHADOW_MODE:
+            if _no_data and _emit_template_insight(groupchat, "[]"):
+                return _advance_after_template_insight(groupchat)
+            return Sql_Generator
         return Sql_Execution_Critic
 
     elif last_speaker is Sql_Execution_Critic:
@@ -1416,32 +1574,101 @@ def state_transition(last_speaker, groupchat):
         if next_agent == "Insight_Generator":
             return Insight_Generator
         if next_agent in ("Sql_Generator", "SQL_Generator"):
+            from jev_trace import record_termination, take_sql_attempts
+
+            from request_state import take_validation_repairs
+
+            if take_validation_repairs() >= SQL_MAX_REPAIR_ROUNDS:
+                from sql_repair_recovery import try_time_window_zero_from_generator_sql
+
+                _mrc = try_time_window_zero_from_generator_sql(groupchat)
+                if _mrc == 0 and _emit_template_insight(groupchat, "[]"):
+                    record_termination(
+                        "sql_validation_recovery_empty",
+                        attempts=take_validation_repairs(),
+                    )
+                    return _advance_after_template_insight(groupchat)
+                record_termination(
+                    "sql_max_repair_rounds",
+                    attempts=take_validation_repairs(),
+                )
+                return Insight_Generator
             return Sql_Generator
 
     elif last_speaker is Insight_Generator:
+        _sql_loop_guard()["insight_done"] = True
+        from jev_trace import event as _jev_event, jev_timed, log_gate_decision
+
+        _insight_ok = False
+        _s9_src = "llm"
+        _qa = ""
+        try:
+            if isinstance(last_message, str):
+                _ins = json.loads(last_message.replace("```json", "").replace("```", "").strip())
+            else:
+                _ins = last_message if isinstance(last_message, dict) else {}
+            _qa = str(_ins.get("query_answer") or "").strip()
+            if _qa and _qa.lower() not in ("none", "null", ""):
+                _insight_ok = True
+                _s9_src = "heuristic"
+        except Exception:  # noqa: BLE001
+            pass
+        if _insight_ok:
+            log_gate_decision(
+                "S9",
+                input_summary={"answer_chars": len(_qa) if _insight_ok else 0},
+                decision="pass",
+                action="skip_llm" if not JEV_SHADOW_MODE else "run_llm",
+                decision_source=_s9_src,
+            )
+            if not JEV_SHADOW_MODE:
+                _jev_event("S9", decision="pass", skip_llm="evaluation_agent", decision_source=_s9_src)
+                groupchat.messages.append({
+                    "name": "evaluation_agent",
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "next_agent": "user_proxy",
+                        "evaluation_status": 1,
+                        "status": "PASS",
+                        "jev_s9": f"source={_s9_src}",
+                    }),
+                })
+                return user_proxy
         # --- S9: JEV fast evaluation gate (skip heavyweight Evaluation_Agent if answer is already great) ---
         if JEV_S9_EVAL_ENABLED:
             try:
                 from jev_client import jev_eval_quality
                 from jev_trace import jev_timed
 
-                _q = _extract_user_question(groupchat.messages[0]["content"])
+                _q = _question_for_request(groupchat)
                 _ans = last_message if isinstance(last_message, str) else json.dumps(last_message)
                 _eq = jev_timed("S9", lambda: jev_eval_quality(_q, _ans))
-                if (
+                _would_skip = bool(
                     _eq["source"] == "openjev"
                     and _eq["skip_llm_eval"]
                     and _eq.get("composite", 0) >= JEV_CONFIDENCE_THRESHOLD
-                ):
-                    from jev_trace import event as _jev_event
-
+                )
+                log_gate_decision(
+                    "S9",
+                    input_summary={
+                        "question_len": len(_q or ""),
+                        "answer_chars": len(_ans or ""),
+                    },
+                    decision="pass" if _would_skip else "defer",
+                    confidence=_eq.get("composite"),
+                    threshold=JEV_CONFIDENCE_THRESHOLD,
+                    action="run_llm" if JEV_SHADOW_MODE or not _would_skip else "skip_llm",
+                    fallback_reason=_jev_gate_fallback(_eq, confident=_would_skip),
+                    shadow_jev_would="skip_llm" if JEV_SHADOW_MODE and _would_skip else None,
+                    decision_source="jev" if _eq.get("source") == "openjev" else "llm",
+                )
+                if _would_skip and not JEV_SHADOW_MODE:
                     _jev_event(
                         "S9",
                         decision="pass",
                         composite=_eq.get("composite"),
                         skip_llm="evaluation_agent",
                     )
-                    # Inject synthetic Evaluation_Agent PASS with JEV scores
                     groupchat.messages.append({
                         "name": "evaluation_agent",
                         "role": "assistant",
@@ -1469,12 +1696,18 @@ def state_transition(last_speaker, groupchat):
             return Sql_Generator
         if next_agent == "Eryl_agent":
             return Eryl_agent
-        if next_agent == "query_transformer":
+        from API_unified import SEMANTIC_QUERY_TRANSFORMER_LLM
+
+        if next_agent == "query_transformer" and SEMANTIC_QUERY_TRANSFORMER_LLM:
             return query_transformer
         if parsed_content.get("evaluation_status") == 1 and parsed_content.get("status") == "PASS":
             return user_proxy
         updated_question = parsed_content.get("updated_question", "None")
-        if updated_question and str(updated_question).strip().lower() not in ("none", ""):
+        if (
+            SEMANTIC_QUERY_TRANSFORMER_LLM
+            and updated_question
+            and str(updated_question).strip().lower() not in ("none", "")
+        ):
             return query_transformer
         return user_proxy
 
@@ -1492,32 +1725,49 @@ def state_transition(last_speaker, groupchat):
         if JEV_S13_CRITIC_ENABLED:
             try:
                 from jev_client import jev_critic_check
-                _q = _extract_user_question(groupchat.messages[0]["content"])
+                _q = _question_for_request(groupchat)
                 _ans = last_message if isinstance(last_message, str) else json.dumps(last_message)
                 # Collect any vector context chunks from earlier eryl messages
-                _ctx_chunks: list = []
-                for _msg in groupchat.messages[-15:]:
-                    if _msg.get("name") == "retriever":
-                        try:
-                            _d = json.loads(_msg.get("content", "{}"))
-                            _ctx_chunks = _d.get("vector_context", [])
+                from gate_inputs import parse_vector_context
+
+                _ctx_chunks = []
+                for _msg in reversed(groupchat.messages[-20:]):
+                    if _msg.get("name") in ("retriever", "Eryl_agent"):
+                        _ctx_chunks = parse_vector_context(_msg.get("content"))
+                        if _ctx_chunks:
                             break
-                        except Exception:
-                            pass
                 from jev_trace import jev_timed
+
+                from jev_trace import event as _jev_event, log_gate_decision
 
                 _crit = jev_timed(
                     "S13",
                     lambda: jev_critic_check(_q, _ans, _ctx_chunks),
                 )
-                if (
+                _faith = float(_crit.get("is_faithful") or 0)
+                _would_skip = bool(
                     _crit["source"] == "openjev"
                     and _crit["ok"]
-                    and min(_crit.get("is_faithful", 0), _crit.get("no_hallucination", 0))
+                    and min(_faith, float(_crit.get("no_hallucination") or 0))
                     >= JEV_CONFIDENCE_THRESHOLD
-                ):
-                    from jev_trace import event as _jev_event
-
+                )
+                log_gate_decision(
+                    "S13",
+                    input_summary={
+                        "question_len": len(_q or ""),
+                        "answer_chars": len(_ans or ""),
+                        "context_chunks": len(_ctx_chunks or []),
+                    },
+                    decision="pass" if _would_skip else "escalate",
+                    confidence=min(_faith, float(_crit.get("no_hallucination") or 0)),
+                    threshold=JEV_CONFIDENCE_THRESHOLD,
+                    action="run_llm" if JEV_SHADOW_MODE or not _would_skip else "skip_llm",
+                    fallback_reason=_jev_gate_fallback(_crit, confident=_would_skip),
+                    shadow_jev_would="skip_llm" if JEV_SHADOW_MODE and _would_skip else None,
+                    is_faithful=_faith,
+                    no_hallucination=_crit.get("no_hallucination"),
+                )
+                if _would_skip and not JEV_SHADOW_MODE:
                     _jev_event(
                         "S13",
                         decision="pass",
@@ -1525,7 +1775,6 @@ def state_transition(last_speaker, groupchat):
                         no_hallucination=_crit.get("no_hallucination"),
                         skip_llm="critic_agent",
                     )
-                    # Answer is faithful → inject synthetic critic PASS → skip to user_proxy
                     groupchat.messages.append({
                         "name": "critic_agent",
                         "role": "assistant",
@@ -1536,7 +1785,6 @@ def state_transition(last_speaker, groupchat):
                     })
                     return user_proxy
                 elif _crit["source"] == "openjev" and not _crit["ok"]:
-                    # Hallucination risk → let LLM critic take over but log concern
                     print(f"[JEV S13] Critic concern: {_crit['concern']} — escalating to LLM critic")
             except Exception as _e:  # noqa: BLE001
                 import logging; logging.getLogger(__name__).warning("JEV S13 critic check failed: %s", _e)
@@ -1745,8 +1993,24 @@ def log_evaluation_to_sql(response: dict, question: str) -> bool:
 _answer_cache: dict = {}  # {question_str: response_dict}
 _CACHE_MAX = 100          # keep last 100 unique answers in memory
 
+try:
+    from llm_telemetry import install as _install_llm_telemetry
+
+    _install_llm_telemetry()
+except Exception:  # noqa: BLE001
+    pass
+
+
+import threading
+
+_GROUPCHAT_LOCK = threading.Lock()
+
 
 def get_final_answer(question):
+    return _get_final_answer_impl(question)
+
+
+def _get_final_answer_impl(question):
     global client, _AZURE_CHAT_PROBE_DONE, _AZURE_CHAT_PROBE_ERROR
 
     from azure_llm_runtime import refresh_azure_openai_runtime
@@ -1754,18 +2018,76 @@ def get_final_answer(question):
     from jev_trace import (
         begin_chat_phase,
         finalize_agent_timeline,
+        persist_request_trace,
         print_latency_summary,
         record_termination,
         reset as _jev_trace_reset,
+        chat_wall_step,
+        get_events as _jev_get_events,
         setup_step,
         snapshot as _jev_trace_snapshot,
         summarize_chat_agents,
     )
 
     request_id = _jev_trace_reset()
+    from jev_trace import set_request_question
+    from request_state import ensure_guard_request_id
+
+    set_request_question(question)
+    _reset_sql_loop_guard(request_id)
+    ensure_guard_request_id(request_id)
+    from API_unified import ORCHESTRATOR, SCHEMA_LINK_TOP_K
+    from schema_linker import linked_schema_block
+
+    from catalog_runtime import bootstrap_catalog
+
+    try:
+        bootstrap_catalog()
+    except Exception:  # noqa: BLE001
+        pass
+    if ORCHESTRATOR == "groupchat":
+        with _GROUPCHAT_LOCK:
+            groupchat.messages.clear()
+    else:
+        groupchat.messages.clear()
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from API_unified import SAFETY_LLM_MODE
+    from safety_gate import (
+        blocked_response,
+        build_azure_safety_payload,
+        evaluate_safety,
+        jev_s1_for_question,
+        log_s1_gate,
+        set_prechat_verdict,
+    )
+
+    def _timed_s1() -> dict | None:
+        if not JEV_S1_SAFETY_ENABLED:
+            return None
+        from jev_client import jev_safety_check
+        from jev_trace import jev_timed
+
+        return jev_timed("S1", lambda: jev_safety_check(question))
+
+    _jev_s1 = None
+    if JEV_S1_SAFETY_ENABLED:
+        _jev_s1 = _timed_s1()
+    try:
+        from data_profile import refresh_data_profile
+
+        refresh_data_profile()
+    except Exception:  # noqa: BLE001
+        pass
+    _verdict = evaluate_safety(question, jev=_jev_s1)
+    log_s1_gate(_verdict, question)
+    _safety_payload = build_azure_safety_payload(question, _verdict)
+    set_prechat_verdict(request_id, _verdict, _safety_payload)
 
     def _finish_trace(resp: dict, chat_history=None, *, termination_reason: str | None = None) -> dict:
-        if chat_history is not None:
+        _pipe = resp.get("_pipeline_transcript")
+        if chat_history is not None or _pipe is not None:
             finalize_agent_timeline()
         if termination_reason:
             record_termination(termination_reason)
@@ -1773,6 +2095,8 @@ def get_final_answer(question):
             record_termination("jev_s2_clarity_block")
         elif resp.get("jev_cache_hit"):
             record_termination("jev_s3_cache_hit")
+        elif _pipe is not None:
+            record_termination(termination_reason or "pipeline_completed")
         elif chat_history is not None:
             rai = resp.get("rai_evaluation") or {}
             if rai and not rai.get("rai_check_passed", True):
@@ -1782,18 +2106,76 @@ def get_final_answer(question):
                 )
             else:
                 names = [m.get("name") for m in getattr(chat_history, "chat_history", []) or []]
-                if "routing_agent" not in names and "Sql_Generator" not in names:
-                    record_termination("chat_ended_before_routing", last_agent=names[-1] if names else None)
+                events = _jev_get_events()
+                s4_skipped = any(
+                    e.get("gate") == "S4" and e.get("skip_llm") for e in events
+                )
+                sql_path = any(
+                    n in names
+                    for n in (
+                        "Sql_Generator",
+                        "Insight_Generator",
+                        "Query_Executor",
+                        "Sql_tool",
+                    )
+                )
+                semantic_path = any(
+                    n in names for n in ("Eryl_agent", "llm_answer_maker", "retriever_agent")
+                )
+                routed = (
+                    "routing_agent" in names
+                    or s4_skipped
+                    or sql_path
+                    or semantic_path
+                )
+                if not routed:
+                    record_termination(
+                        "chat_ended_before_routing", last_agent=names[-1] if names else None
+                    )
                 else:
                     record_termination("completed", last_agent=names[-1] if names else None)
         else:
             record_termination(termination_reason or "early_exit")
+        if _pipe is not None:
+            resp.pop("_pipeline_transcript", None)
         trace = _jev_trace_snapshot()
         if chat_history is not None:
             trace.update(summarize_chat_agents(chat_history))
+        elif _pipe is not None:
+            from jev_trace import summarize_pipeline_transcript
+
+            trace.update(summarize_pipeline_transcript(_pipe))
         print_latency_summary(trace.get("latency"))
+        persist_request_trace(trace.get("latency"))
         resp["jev_trace"] = trace
-        return resp
+        from pii_output import apply_pii_redaction
+
+        return apply_pii_redaction(resp)
+
+    if _verdict.action == "block":
+        _term = "safety_blocked"
+        if any(str(r).startswith("jev_unavailable") for r in _verdict.reasons):
+            _term = "safety_jev_unavailable"
+        return _finish_trace(
+            blocked_response(_verdict, question),
+            termination_reason=_term,
+        )
+    from routing_s4 import preflight_s4
+
+    _s4 = preflight_s4(question, schema_summary=SQL_Meta_Data)
+    if _s4.handled and _s4.finish_response:
+        return _finish_trace(_s4.finish_response, termination_reason="s4_both_preflight")
+    if _s4.route and _s4.next_agent:
+        from request_state import set_jev_route
+
+        set_jev_route(_s4.route, _s4.next_agent)
+
+    try:
+        from llm_telemetry import reset as _llm_telemetry_reset
+
+        _llm_telemetry_reset()
+    except Exception:  # noqa: BLE001
+        pass
 
     with setup_step("azure_openai_refresh"):
         endpoint, client = refresh_azure_openai_runtime(llm_config)
@@ -1866,6 +2248,21 @@ def get_final_answer(question):
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S2 clarity check failed: %s", _e)
 
+    from dual_route import infer_dual_route
+
+    if infer_dual_route(question) == "Both-independent":
+        from both_answer import both_independent_answer
+        from jev_trace import event as _jev_event
+
+        _jev_event(
+            "S4",
+            decision="route",
+            choice="Both-independent",
+            skip_llm="both_parallel",
+        )
+        _both = both_independent_answer(question, parallel=True)
+        return _finish_trace(_both, termination_reason="both_independent")
+
     # --- S3: Semantic cache check (handled later in this function, cache dict at module level) ---
     if JEV_S3_CACHE_ENABLED:
         from jev_client import jev_cache_intent_match
@@ -1891,7 +2288,83 @@ def get_final_answer(question):
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S5 model router failed: %s", _e)
 
-    # Initiate chat
+    from API_unified import ORCHESTRATOR
+
+    if ORCHESTRATOR != "groupchat":
+        begin_chat_phase()
+        from orchestrator import run_pipeline
+        from request_state import jev_route_choice, jev_route_next_agent
+
+        _route = _s4.route or jev_route_choice()
+        _next = _s4.next_agent or jev_route_next_agent()
+        with chat_wall_step("orchestrator_pipeline"):
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+            _pipe_deadline_s = float(REQUEST_TIMEOUT_S)
+
+            def _run_pipeline():
+                return run_pipeline(
+                    question,
+                    request_id=request_id,
+                    route=_route,
+                    next_agent=_next,
+                    finish=_finish_trace,
+                    base_response=response,
+                )
+
+            _pipe_pool = ThreadPoolExecutor(max_workers=1)
+            _pipe_fut = _pipe_pool.submit(_run_pipeline)
+            try:
+                response = _pipe_fut.result(timeout=_pipe_deadline_s)
+            except FuturesTimeout:
+                _pipe_fut.cancel()
+                _pipe_pool.shutdown(wait=False, cancel_futures=True)
+                msg = (
+                    f"Request exceeded REQUEST_TIMEOUT_S ({REQUEST_TIMEOUT_S}s). "
+                    "Check DB retry loop, LLM latency, or JEV queue."
+                )
+                response["llm_answer"] = msg
+                response["Reasoning"] = "request_timeout"
+                response["final_answer"] = {"query_answer": "", "llm_answer": msg}
+                return _finish_trace(response, termination_reason="request_timeout")
+            finally:
+                if not _pipe_pool._shutdown:  # noqa: SLF001
+                    _pipe_pool.shutdown(wait=False, cancel_futures=True)
+        if not str(response.get("query_answer") or "").strip():
+            from jev_trace import get_template_insight
+
+            _tins = get_template_insight()
+            if _tins:
+                response["query_answer"] = _tins.get("query_answer")
+                if _tins.get("executed_sql") and not response.get("query"):
+                    response["query"] = _tins.get("executed_sql")
+                response["final_answer"] = {
+                    "query_answer": _tins.get("query_answer") or "",
+                    "llm_answer": response.get("llm_answer") or "",
+                }
+        if JEV_S3_CACHE_ENABLED and question and not response.get("jev_cache_hit"):
+            if len(_answer_cache) >= _CACHE_MAX:
+                _answer_cache.pop(next(iter(_answer_cache)), None)
+            _answer_cache[question] = dict(response)
+        if JEV_S14_OUTPUT_GUARD_ENABLED:
+            try:
+                from jev_client import jev_output_guard
+
+                _full_text = " ".join(
+                    filter(None, [str(response.get("query_answer", "")), str(response.get("llm_answer", ""))])
+                )
+                if _full_text.strip():
+                    _guard = jev_output_guard(_full_text)
+                    response["jev_output_guard"] = _guard
+                    if _guard.get("block"):
+                        _redact = "[REDACTED: output safety guard]"
+                        response["query_answer"] = response["llm_answer"] = _redact
+                        response["final_answer"] = {"query_answer": _redact, "llm_answer": _redact}
+            except Exception:  # noqa: BLE001
+                pass
+        return response
+
+    # Initiate chat (rollback: ORCHESTRATOR=groupchat)
     template = f'"question": {question}'
     logging_session_id = None
     if AUTOGEN_RUNTIME_LOG_ENABLED:
@@ -1903,14 +2376,33 @@ def get_final_answer(question):
         print("Logging session ID: " + str(logging_session_id))
     start = time.time()
     begin_chat_phase()
+    _chat_deadline_s = float(REQUEST_TIMEOUT_S)
     try:
-        with setup_step("initiate_chat"):
-            chat_history = user_proxy.initiate_chat(
-                manager,
-                message=template,
-                summary_method="reflection_with_llm",
-            )
+        with chat_wall_step("initiate_chat"):
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+            def _run_chat():
+                with _GROUPCHAT_LOCK:
+                    return user_proxy.initiate_chat(
+                        manager,
+                        message=template,
+                        summary_method="last_msg",
+                    )
+
+            with ThreadPoolExecutor(max_workers=1) as _pool:
+                chat_history = _pool.submit(_run_chat).result(timeout=_chat_deadline_s)
     except Exception as chat_exc:  # noqa: BLE001
+        from concurrent.futures import TimeoutError as FuturesTimeout
+
+        if isinstance(chat_exc, FuturesTimeout):
+            msg = (
+                f"Request exceeded REQUEST_TIMEOUT_S ({REQUEST_TIMEOUT_S}s). "
+                "Check DB retry loop or LLM latency."
+            )
+            response["llm_answer"] = msg
+            response["Reasoning"] = "request_timeout"
+            response["final_answer"] = {"query_answer": "", "llm_answer": msg}
+            return _finish_trace(response, termination_reason="request_timeout")
         msg = str(chat_exc)
         if (
             "401" in msg
@@ -1952,6 +2444,7 @@ def get_final_answer(question):
     for item in chat_history.chat_history:
         if item['name'] == 'Responsible_AI_Agent':
             parsed_content = json.loads(item.get('content').replace("```json", "").replace("```", "").strip())
+            parsed_content["evaluation_timestamp"] = evaluation_timestamp_iso()
             response["rai_evaluation"] = parsed_content
             if not parsed_content.get("rai_check_passed", True):
                 block_reason = parsed_content.get("blocked_reason") or parsed_content.get("reason", "Responsible AI check failed.")
@@ -2115,6 +2608,43 @@ def get_final_answer(question):
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S14 output guard failed: %s", _e)
 
+    if not str(response.get("query_answer") or "").strip():
+        from jev_trace import get_template_insight
+
+        _tins = get_template_insight()
+        if _tins:
+            response["query_answer"] = _tins.get("query_answer")
+            if _tins.get("executed_sql") and not response.get("query"):
+                response["query"] = _tins.get("executed_sql")
+            response["final_answer"] = {
+                "query_answer": _tins.get("query_answer") or "",
+                "llm_answer": response.get("llm_answer") or "",
+            }
+        else:
+            for item in reversed(getattr(chat_history, "chat_history", []) or []):
+                if item.get("name") != "Insight_Generator":
+                    continue
+                try:
+                    _ins = json.loads(
+                        str(item.get("content") or "")
+                        .replace("```json", "")
+                        .replace("```", "")
+                        .strip()
+                    )
+                except json.JSONDecodeError:
+                    break
+                response["query_answer"] = _ins.get("query_answer")
+                if _ins.get("executed_sql") and not response.get("query"):
+                    response["query"] = _ins.get("executed_sql")
+                response["final_answer"] = {
+                    "query_answer": _ins.get("query_answer") or "",
+                    "llm_answer": response.get("llm_answer") or "",
+                }
+                break
+
+    response["_insight_generator_turns"] = sum(
+        1 for m in getattr(chat_history, "chat_history", []) or [] if m.get("name") == "Insight_Generator"
+    )
     return _finish_trace(response, chat_history)
 
 # # question = "Which product has the lowest stock in my inventory and list down the distributors supplying that product?, mail_id :i-saranya.swadha@affine.ai"

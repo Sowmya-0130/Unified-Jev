@@ -10,6 +10,20 @@ _WRITE_DDL = re.compile(
 _XP_PATTERN = re.compile(r"\b(xp_|sp_msforeachtable|sp_executesql)\b", re.IGNORECASE)
 
 
+_DBO_SCHEMA_TABLE = re.compile(
+    r"\bdbo\.([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_agent_sql_identifiers(query: str) -> str:
+    """
+    AutoGen often emits dbo.Schema.Table from cached metadata labels.
+    On Azure SQL the real object is usually [Schema].[Table], not dbo.Schema.Table.
+    """
+    return _DBO_SCHEMA_TABLE.sub(r"[\1].[\2]", query)
+
+
 def assert_readonly_sql(query: str) -> None:
     """Raise ValueError if the statement is not a safe read-only SELECT."""
     if not query or not str(query).strip():

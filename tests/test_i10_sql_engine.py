@@ -9,6 +9,7 @@ import textwrap
 import pytest
 
 
+@pytest.mark.live
 def test_db_execute_after_aurix_import():
     import aurix_core
     from metadata import fetch_dataframe_readonly

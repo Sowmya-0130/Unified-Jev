@@ -1,6 +1,70 @@
 .env
 .venv/
 __pycache__/
+.pytest_cache/
 .cache/
 *.pyc
 info.db
+
+# Local agent / cycle (never publish)
+.loop/
+.cursor/
+*.patch
+
+# Runtime / traces
+**/traces/
+**/logs/
+
+# Local tracking
+ISSUES.md
+JEV_INTEGRATION_TRACKER.md
+MORNING_REPORT.md
+ROOT_CAUSE*.md
+empty-boots-rca*.md
+
+# GraphRAG local index (regenerate locally)
+artifacts/
+
+# Plan artifacts outside repo
+*.plan.md
+
+# Dev / probe scripts (local diagnostics)
+/test_sql.py
+/test_azure_openai.py
+/check_jev.py
+/scripts/i01_*
+/scripts/sql_probe.py
+/scripts/sql_connection_diff.py
+/scripts/jev_smoke_trace.py
+/scripts/bench.py
+/scripts/bench_cache_verify.py
+/scripts/latency_budget.py
+/scripts/latency_ab_orchestrator.py
+/scripts/a2_token_smoke.py
+/scripts/iter6_token_breakdown.py
+/scripts/s7_payload_show.py
+/scripts/s13_kevlar_probe.py
+/scripts/catalog_probe_tables.py
+/scripts/catalog_bracket_sample.py
+/scripts/print_linked_schema.py
+/scripts/ref_sql_values.py
+/scripts/table_name_case.py
+/scripts/validate_failed_sql.py
+/scripts/validator_bench_selftest.py
+/scripts/verify_buckets.py
+/scripts/verify_loop.py
+/scripts/_migrate_jev_trace_tls.py
+/scripts/_probe_count_once.py
+/scripts/repro_inprocess_leak.py
+
+# Eval tune / report (not acceptance gates)
+/eval/jev_load_probe.py
+/eval/safety_shadow.py
+/eval/safety_threshold_tune.py
+/eval/safety_s1_report.py
+/eval/safety_acceptance_summary.py
+/eval/block_margin_report.py
+/eval/rescore_block_429.py
+
+# Offline ingest (optional)
+/ingest_triage.py

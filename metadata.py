@@ -140,17 +140,18 @@ def warm_odbc_connection() -> bool:
         return False
 
 
-def fetch_dataframe_readonly(sql: str):
-    """Read-only SELECT via direct pyodbc connection (autocommit=True avoids HY000 on Windows)."""
+def _fetch_dataframe_readonly_inner(sql: str):
+    """Run ODBC read loop (used under SQL_QUERY_TIMEOUT_S wall clock cap)."""
     import pandas as pd
 
-    from sql_safety import assert_readonly_sql, normalize_agent_sql_identifiers
+    from sql_safety import assert_readonly_sql
 
     assert_readonly_sql(sql)
-    sql = normalize_agent_sql_identifiers(sql)
+    from sql_pipeline import classify_sql_exception, max_retries_for_exception
+
     last_err: Exception | None = None
-    attempts = max(1, AZURE_SQL_ODBC_RETRIES)
-    for attempt in range(attempts):
+    max_try = 1
+    for attempt in range(max_try):
         try:
             conn = pyodbc.connect(_build_odbc_str(), autocommit=True)
             try:
@@ -160,10 +161,10 @@ def fetch_dataframe_readonly(sql: str):
                 columns = [col[0] for col in cursor.description] if cursor.description else []
             finally:
                 conn.close()
-            # pyodbc Row objects are not plain tuples; convert to avoid
-            # pandas "Shape of passed values" error on multi-column results.
             return pd.DataFrame.from_records(rows, columns=columns)
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, TimeoutError):
+                raise
             last_err = exc
             try:
                 from jev_trace import bump_sql_attempt
@@ -171,11 +172,39 @@ def fetch_dataframe_readonly(sql: str):
                 bump_sql_attempt()
             except ImportError:
                 pass
-            _log.warning("read_sql attempt %s/%s failed: %s", attempt + 1, attempts, exc)
-            if attempt + 1 < attempts:
+            max_try = max(1, attempt + 1 + max_retries_for_exception(exc))
+            if classify_sql_exception(exc) == "permanent":
+                break
+            _log.warning("read_sql attempt %s/%s failed: %s", attempt + 1, max_try, exc)
+            if attempt + 1 < max_try:
                 time.sleep(1.0 * (attempt + 1))
     assert last_err is not None
     raise last_err
+
+
+def fetch_dataframe_readonly(sql: str):
+    """Read-only SELECT; hard-capped by SQL_QUERY_TIMEOUT_S."""
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FuturesTimeout
+
+    from API_unified import SQL_QUERY_TIMEOUT_S as _sql_deadline_s
+
+    deadline = max(1.0, float(_sql_deadline_s))
+    pool = ThreadPoolExecutor(max_workers=1)
+    fut = pool.submit(_fetch_dataframe_readonly_inner, sql)
+    try:
+        return fut.result(timeout=deadline)
+    except FuturesTimeout as exc:
+        if hasattr(fut, "cancel"):
+            fut.cancel()
+        if hasattr(pool, "shutdown"):
+            pool.shutdown(wait=False, cancel_futures=True)
+        raise TimeoutError(
+            f"SQL query exceeded SQL_QUERY_TIMEOUT_S ({_sql_deadline_s}s)"
+        ) from exc
+    finally:
+        if hasattr(pool, "shutdown") and not getattr(pool, "_shutdown", False):
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def recreate_sql_engine() -> None:
@@ -194,25 +223,8 @@ def dispose_sql_engine() -> None:
 
 
 def run_sql_with_retry(operation: Callable[[], T], *, attempts: int | None = None) -> T:
-    """Run a DB operation with retries (ODBC HY000 after long AutoGen runs on Windows)."""
-    tries = max(1, attempts or AZURE_SQL_ODBC_RETRIES)
-    last_err: Exception | None = None
-    for attempt in range(tries):
-        try:
-            return operation()
-        except Exception as exc:  # noqa: BLE001
-            last_err = exc
-            try:
-                from jev_trace import bump_sql_attempt
-
-                bump_sql_attempt()
-            except ImportError:
-                pass
-            _log.warning("SQL operation attempt %s/%s failed: %s", attempt + 1, tries, exc)
-            if attempt + 1 < tries:
-                time.sleep(1.25 * (attempt + 1))
-    assert last_err is not None
-    raise last_err
+    """Single operation call — retries live inside fetch_dataframe_readonly only."""
+    return operation()
 
 # Step 2: Fetch tables from the specified schema dynamically
 def get_schema_tables(engine, schema_name):

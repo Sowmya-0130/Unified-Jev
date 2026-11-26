@@ -14,11 +14,39 @@ Enable by setting in .env:
     JEV_CONFIDENCE_THRESHOLD=0.75   # 0.0–1.0; below this falls back to Azure LLM
 """
 
+import json
 import logging
+import threading
+import time
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+_jev_http: httpx.Client | None = None
+_last_jev_failure: str | None = None
+_jev_slot_sem: threading.Semaphore | None = None
+_last_retry_after_s: float | None = None
+
+
+def jev_last_failure() -> str | None:
+    """Why the last JEV HTTP call failed: timeout | error | malformed | flag_off | http:429."""
+    return _last_jev_failure
+
+
+def jev_last_retry_after_s() -> float | None:
+    return _last_retry_after_s
+
+
+def reset_jev_http() -> None:
+    global _jev_http
+    if _jev_http is not None:
+        try:
+            _jev_http.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _jev_http = None
+
 
 # ---------------------------------------------------------------------------
 # Lazy import of API_unified so this module can be imported at any point
@@ -27,6 +55,14 @@ logger = logging.getLogger(__name__)
 def _get_jev_config():
     from API_unified import JEV_API_KEY, JEV_API_BASE, JEV_MODEL
     return JEV_API_KEY, JEV_API_BASE, JEV_MODEL
+
+
+def _http_client() -> httpx.Client:
+    global _jev_http
+    if _jev_http is None:
+        from API_unified import JEV_TIMEOUT_MS
+        _jev_http = httpx.Client(timeout=max(0.1, JEV_TIMEOUT_MS / 1000.0))
+    return _jev_http
 
 
 # Routing choices must match the labels routing_agent uses in main.py
@@ -63,54 +99,28 @@ def jev_routing_decision(question: str, table_schemas_summary: str = "") -> dict
     _fallback = {"choice": None, "confidence": 0.0, "probabilities": {}, "source": "fallback"}
 
     if not JEV_API_KEY:
-        logger.debug("JEV_API_KEY not set — skipping OpenJev routing.")
         return _fallback
 
-    # Build state: question + truncated schema so total tokens stay small
     schema_snippet = (table_schemas_summary or "")[:2000]
     state_parts = [f"User question: {question}"]
     if schema_snippet:
         state_parts.append(f"Available SQL tables (summary):\n{schema_snippet}")
     state = "\n\n".join(state_parts)
-
-    payload = {
-        "model": JEV_MODEL,
-        "state": state,
-        "questions": {
-            "route": {
-                "type": "choice",
-                "instructions": (
-                    "Given the user question and the available SQL table summary, "
-                    "choose the best pipeline to handle this request."
-                ),
-                "criteria": _ROUTING_CRITERIA,
-            }
-        },
+    questions = {
+        "route": {
+            "type": "choice",
+            "instructions": (
+                "Given the user question and the available SQL table summary, "
+                "choose the best pipeline to handle this request."
+            ),
+            "criteria": _ROUTING_CRITERIA,
+        }
     }
-
+    answers = _jev_post(state, questions)
+    if answers is None:
+        return _fallback
     try:
-        resp = httpx.post(
-            f"{JEV_API_BASE}/v1/systemone",
-            headers={
-                "Authorization": f"Bearer {JEV_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-    except httpx.TimeoutException:
-        logger.warning("OpenJev request timed out — falling back to Azure LLM routing.")
-        return _fallback
-    except httpx.HTTPStatusError as exc:
-        logger.warning("OpenJev HTTP error %s — falling back to Azure LLM routing.", exc.response.status_code)
-        return _fallback
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("OpenJev unexpected error (%s) — falling back to Azure LLM routing.", exc)
-        return _fallback
-
-    try:
-        answer = resp.json()["answers"]["route"]
+        answer = answers["route"]
         return {
             "choice": answer.get("choice"),
             "confidence": float(answer.get("confidence", 0.0)),
@@ -134,29 +144,107 @@ def _jev_confidence_threshold() -> float:
         return 0.8
 
 
+def _jev_slot() -> threading.Semaphore:
+    global _jev_slot_sem
+    if _jev_slot_sem is None:
+        from API_unified import JEV_MAX_CONCURRENCY
+
+        _jev_slot_sem = threading.Semaphore(max(1, int(JEV_MAX_CONCURRENCY)))
+    return _jev_slot_sem
+
+
+def _parse_retry_after(resp: httpx.Response) -> float:
+    global _last_retry_after_s
+    raw = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+    if not raw:
+        _last_retry_after_s = None
+        return 0.0
+    try:
+        sec = float(raw)
+    except ValueError:
+        _last_retry_after_s = None
+        return 0.0
+    _last_retry_after_s = sec
+    return max(0.0, sec)
+
+
 def _jev_post(state: str, questions: dict) -> dict | None:
     """
-    Single httpx POST to /v1/systemone.
-    Returns the parsed JSON `answers` dict on success, or None on any failure.
+    POST /v1/systemone with concurrency cap, retries, Retry-After (429/503).
+    Returns answers dict or None on failure.
     """
+    global _last_jev_failure, _last_retry_after_s
+    from API_unified import JEV_RETRY_BASE_MS, JEV_RETRY_MAX
+
+    _last_jev_failure = None
+    _last_retry_after_s = None
     JEV_API_KEY, JEV_API_BASE, JEV_MODEL = _get_jev_config()
     if not JEV_API_KEY:
+        _last_jev_failure = "flag_off"
         return None
-    try:
-        resp = httpx.post(
-            f"{JEV_API_BASE}/v1/systemone",
-            headers={"Authorization": f"Bearer {JEV_API_KEY}", "Content-Type": "application/json"},
-            json={"model": JEV_MODEL, "state": state, "questions": questions},
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        return resp.json().get("answers", {})
-    except httpx.TimeoutException:
-        logger.warning("OpenJev timeout.")
-    except httpx.HTTPStatusError as e:
-        logger.warning("OpenJev HTTP %s.", e.response.status_code)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("OpenJev error: %s.", e)
+
+    max_attempts = int(JEV_RETRY_MAX) + 1
+    base_ms = float(JEV_RETRY_BASE_MS)
+    last_exc: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            with _jev_slot():
+                resp = _http_client().post(
+                    f"{JEV_API_BASE}/v1/systemone",
+                    headers={
+                        "Authorization": f"Bearer {JEV_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"model": JEV_MODEL, "state": state, "questions": questions},
+                )
+            if resp.status_code == 429:
+                wait_s = _parse_retry_after(resp) or (base_ms / 1000.0 * (2**attempt))
+                _last_jev_failure = "http:429"
+                logger.warning("OpenJev HTTP 429; retry in %.2fs (attempt %s).", wait_s, attempt + 1)
+                if attempt + 1 >= max_attempts:
+                    break
+                time.sleep(wait_s)
+                continue
+            if resp.status_code >= 500:
+                _last_jev_failure = f"http:{resp.status_code}"
+                wait_s = _parse_retry_after(resp) or (base_ms / 1000.0 * (2**attempt))
+                logger.warning("OpenJev HTTP %s; retry in %.2fs.", resp.status_code, wait_s)
+                if attempt + 1 >= max_attempts:
+                    break
+                time.sleep(wait_s)
+                continue
+            resp.raise_for_status()
+            body = resp.json()
+            answers = body.get("answers")
+            if not isinstance(answers, dict):
+                _last_jev_failure = "malformed"
+                logger.warning("OpenJev malformed response (no answers dict).")
+                return None
+            return answers
+        except httpx.TimeoutException as e:
+            last_exc = e
+            _last_jev_failure = "timeout"
+            logger.warning("OpenJev timeout (attempt %s).", attempt + 1)
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            code = e.response.status_code
+            _last_jev_failure = f"http:{code}"
+            logger.warning("OpenJev HTTP %s.", code)
+            if code in (408, 425, 429, 500, 502, 503, 504) and attempt + 1 < max_attempts:
+                time.sleep(base_ms / 1000.0 * (2**attempt))
+                continue
+            break
+        except Exception as e:  # noqa: BLE001
+            last_exc = e
+            _last_jev_failure = "error"
+            logger.warning("OpenJev error: %s.", e)
+            if attempt + 1 < max_attempts:
+                time.sleep(base_ms / 1000.0 * (2**attempt))
+                continue
+            break
+    if last_exc and not _last_jev_failure:
+        _last_jev_failure = "error"
     return None
 
 
@@ -189,20 +277,27 @@ def _score_val(answers: dict, key: str) -> float:
 # STEP 1 — Safety Gate
 # ===========================================================================
 
-def jev_safety_check(question: str) -> dict:
-    """
-    Run 3 Noul checks in one forward pass to augment azure_safety_check().
+def _parse_s1_noul_scores(answers: dict) -> dict[str, float] | None:
+    out: dict[str, float] = {}
+    for key in ("is_toxic", "has_pii", "is_injection"):
+        try:
+            out[key] = float(answers[key]["noul"])
+        except (KeyError, TypeError, ValueError):
+            return None
+    return out
 
-    Returns
-    -------
-    dict:
-        is_toxic      float  P(toxic)
-        has_pii       float  P(contains PII)
-        is_injection  float  P(prompt injection / jailbreak)
-        block         bool   True if any score > 0.85
-        source        str    "openjev" | "fallback"
-    """
-    _fallback = {"is_toxic": 0.0, "has_pii": 0.0, "is_injection": 0.0, "block": False, "source": "fallback"}
+
+def jev_safety_check(question: str) -> dict:
+    """S1 noul heads; fail-closed → unavailable (never zero-score allow)."""
+    _unavail = {
+        "is_toxic": None,
+        "has_pii": None,
+        "is_injection": None,
+        "block": True,
+        "unavailable": True,
+        "source": "jev_unavailable",
+        "failure": None,
+    }
     state = f"User input to an enterprise AI assistant:\n\n{question[:3000]}"
     questions = {
         "is_toxic": {
@@ -220,12 +315,26 @@ def jev_safety_check(question: str) -> dict:
     }
     answers = _jev_post(state, questions)
     if answers is None:
-        return _fallback
-    p_toxic = _noul(answers, "is_toxic")
-    p_pii   = _noul(answers, "has_pii")
-    p_inj   = _noul(answers, "is_injection")
-    block   = p_toxic > 0.85 or p_inj > 0.85
-    return {"is_toxic": p_toxic, "has_pii": p_pii, "is_injection": p_inj, "block": block, "source": "openjev"}
+        _unavail["failure"] = jev_last_failure()
+        return _unavail
+    scored = _parse_s1_noul_scores(answers)
+    if scored is None:
+        global _last_jev_failure
+        _last_jev_failure = "malformed"
+        _unavail["failure"] = "malformed"
+        return _unavail
+    p_toxic = scored["is_toxic"]
+    p_pii = scored["has_pii"]
+    p_inj = scored["is_injection"]
+    block = p_toxic > 0.85 or p_inj > 0.85
+    return {
+        "is_toxic": p_toxic,
+        "has_pii": p_pii,
+        "is_injection": p_inj,
+        "block": block,
+        "source": "openjev",
+        "unavailable": False,
+    }
 
 
 # ===========================================================================
@@ -295,6 +404,89 @@ def jev_sql_guard(sql_query: str, valid_tables: list) -> dict:
 # STEP 7 — SQL Execution Result Check
 # ===========================================================================
 
+def _rows_all_null(rows: list) -> bool:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for v in row.values():
+            if v is None:
+                continue
+            if str(v).strip().lower() in ("", "null", "none"):
+                continue
+            return False
+    return True
+
+
+def _heuristic_sql_result_check(sql_result: str) -> dict | None:
+    raw = str(sql_result or "").strip()
+    if not raw:
+        return {
+            "is_valid": False,
+            "error_type": "empty_result",
+            "no_matching_data": True,
+            "confidence": 0.9,
+            "source": "heuristic",
+        }
+    lower = raw.lower()
+    if (
+        lower.startswith("error")
+        or "an error occurred" in lower[:200]
+        or "query blocked" in lower[:200]
+        or "traceback" in lower[:300]
+        or "hy000" in lower
+        or "invalid object" in lower
+        or (raw.startswith("{") and "error" in raw[:400].lower())
+    ):
+        return {
+            "is_valid": False,
+            "error_type": "unknown_error",
+            "confidence": 0.9,
+            "source": "heuristic",
+        }
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and "sql_query" in data:
+        return None
+    if isinstance(data, list):
+        if len(data) == 0:
+            return {
+                "is_valid": False,
+                "error_type": "empty_result",
+                "no_matching_data": True,
+                "confidence": 0.9,
+                "source": "heuristic",
+            }
+        if all(isinstance(row, dict) for row in data):
+            if _rows_all_null(data):
+                return {
+                    "is_valid": False,
+                    "error_type": "empty_result",
+                    "no_matching_data": True,
+                    "confidence": 0.92,
+                    "source": "heuristic",
+                }
+            return {
+                "is_valid": True,
+                "error_type": "ok",
+                "confidence": 0.95,
+                "source": "heuristic",
+            }
+    return None
+
+
+def s7_resolve(sql_result: str, *, jev_enabled: bool) -> dict:
+    """Heuristic always runs; JEV only if enabled and heuristic inconclusive."""
+    pre = _heuristic_sql_result_check(sql_result)
+    if pre is not None:
+        pre["decision_source"] = "heuristic"
+        return pre
+    if not jev_enabled:
+        return {"is_valid": None, "source": "llm", "decision_source": "llm"}
+    return jev_sql_result_check(sql_result)
+
+
 def jev_sql_result_check(sql_result: str) -> dict:
     """
     Fast check on the raw SQL execution output (JSON rows or error string).
@@ -338,6 +530,7 @@ def jev_sql_result_check(sql_result: str) -> dict:
         "error_type": err_type or "ok",
         "confidence": confidence,
         "source": "openjev",
+        "decision_source": "jev",
     }
 
 

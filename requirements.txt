@@ -15,5 +15,9 @@ scipy
 aiohttp
 tqdm
 streamlit
+uvicorn>=0.52.0
 httpx
 # typesafe-sdk   # optional — alternative to httpx for OpenJev; uncomment if preferred
+sqlglot
+pyodbc
+PyYAML

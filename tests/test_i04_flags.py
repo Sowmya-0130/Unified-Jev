@@ -1,4 +1,4 @@
-"""JEV feature flags reload when API_unified is re-imported with override=True .env."""
+"""JEV flags follow os.environ when reload skips dotenv (simulated restart)."""
 from __future__ import annotations
 
 import importlib

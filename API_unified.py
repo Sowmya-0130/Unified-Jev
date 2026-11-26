@@ -11,11 +11,12 @@ from dotenv import load_dotenv
 
 _ROOT = Path(__file__).resolve().parent
 
-# Load .env once at import — do not override existing process environment.
-_ENV_LOADED = False
-if not _ENV_LOADED:
-    load_dotenv(dotenv_path=_ROOT / ".env", override=False)
-    _ENV_LOADED = True
+# Load .env at import; override=True so local .env edits win over stale shell env (e.g. after pytest).
+def _load_dotenv_file() -> None:
+    load_dotenv(dotenv_path=_ROOT / ".env", override=True)
+
+
+_load_dotenv_file()
 
 
 def _env(name: str, default: str = "") -> str:
@@ -39,21 +40,57 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _env_float(name: str, default: float = 0.0) -> float:
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Azure OpenAI — main (AutoGen agents + search embeddings)
 # ---------------------------------------------------------------------------
-AZURE_OPENAI_API_KEY = _env("AZURE_OPENAI_API_KEY")
-_AZURE_OPENAI_API_BASE_REQUESTED = _env("AZURE_OPENAI_API_BASE")
+AZURE_OPENAI_API_KEY = _env("AZURE_OPENAI_API_KEY") or _env("AZURE_OPENAI_KEY")
+_AZURE_OPENAI_API_BASE_REQUESTED = (
+    _env("AZURE_OPENAI_API_BASE") or _env("AZURE_OPENAI_ENDPOINT")
+)
 AZURE_OPENAI_API_BASE_FALLBACKS = _env("AZURE_OPENAI_API_BASE_FALLBACKS")
-AZURE_OPENAI_API_VERSION = _env("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-GPT4_LLM_MODEL_DEPLOYMENT_NAME = _env("GPT4_LLM_MODEL_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = (
+    _env("AZURE_OPENAI_API_VERSION") or _env("CHAT_API_VERSION") or "2024-02-15-preview"
+)
+GPT4_LLM_MODEL_DEPLOYMENT_NAME = (
+    _env("GPT4_LLM_MODEL_DEPLOYMENT_NAME")
+    or _env("CHAT_DEPLOYMENT")
+    or _env("CHAT_MODEL_NAME")
+)
+# gpt-5* deployments only accept temperature=1 (Azure returns 400 for 0.1).
+_temp_raw = _env("AZURE_LLM_TEMPERATURE")
+if _temp_raw:
+    AZURE_LLM_TEMPERATURE = _env_float("AZURE_LLM_TEMPERATURE", 1.0)
+elif "gpt-5" in (GPT4_LLM_MODEL_DEPLOYMENT_NAME or "").lower():
+    AZURE_LLM_TEMPERATURE = 1.0
+else:
+    AZURE_LLM_TEMPERATURE = 0.1
 AZURE_LLM_REQUEST_TIMEOUT = _env_int("AZURE_LLM_REQUEST_TIMEOUT", 120)
+_llm_req_s = _env("LLM_REQUEST_TIMEOUT_S")
+LLM_REQUEST_TIMEOUT_S = max(10, int(_llm_req_s)) if _llm_req_s else AZURE_LLM_REQUEST_TIMEOUT
+_req_timeout = _env("REQUEST_TIMEOUT_S")
+REQUEST_TIMEOUT_S = max(60, int(_req_timeout)) if _req_timeout else 600
+REQUEST_LOCK_WAIT_S = max(5, _env_int("REQUEST_LOCK_WAIT_S", 30))
 AZURE_LLM_MAX_RETRIES = _env_int("AZURE_LLM_MAX_RETRIES", 2)
 AZURE_LLM_PREFLIGHT_ENABLED = _env_bool("AZURE_LLM_PREFLIGHT_ENABLED", False)
 # Fast chat probe before AutoGen (clear message on 401/DNS; not the old DNS-only UI block).
 AZURE_OPENAI_PROBE_BEFORE_CHAT = _env_bool("AZURE_OPENAI_PROBE_BEFORE_CHAT", False)
 # Both spellings accepted; EMBEDDING_MODEL is the canonical .env key
-Embedding_Model = _env("EMBEDDING_MODEL") or _env("Embedding_Model")
+Embedding_Model = (
+    _env("EMBEDDING_MODEL")
+    or _env("Embedding_Model")
+    or _env("EMBEDDING_DEPLOYMENT")
+    or _env("EMBEDDING_MODEL_NAME")
+)
 
 from azure_openai_endpoint import install_openai_dns_alias_patch, resolve_azure_openai_endpoint
 
@@ -66,11 +103,13 @@ AZURE_OPENAI_API_BASE, _azure_ep_note = resolve_azure_openai_endpoint(
 # ---------------------------------------------------------------------------
 # Azure AI Search
 # ---------------------------------------------------------------------------
-AZURE_SEARCH_SERVICE_ENDPOINT = _env("AZURE_SEARCH_SERVICE_ENDPOINT").rstrip("/")
-_search_key = _env("AZURE_SEARCH_ADMIN_KEY")
+AZURE_SEARCH_SERVICE_ENDPOINT = (
+    _env("AZURE_SEARCH_SERVICE_ENDPOINT") or _env("AZURE_SEARCH_ENDPOINT")
+).rstrip("/")
+_search_key = _env("AZURE_SEARCH_ADMIN_KEY") or _env("AZURE_SEARCH_KEY")
 azure_search_credential = AzureKeyCredential(_search_key) if _search_key else None
 
-IN_Name = _env("IN_NAME")
+IN_Name = _env("IN_NAME") or _env("SEARCH_INDEX_NAME")
 
 # ---------------------------------------------------------------------------
 # GraphRAG Azure OpenAI (falls back to main settings when env vars are empty)
@@ -98,6 +137,8 @@ AZURE_SQL_SCHEMA = _env("AZURE_SQL_SCHEMA")
 AZURE_SQL_ENCRYPT = _env_bool("AZURE_SQL_ENCRYPT", True)
 AZURE_SQL_TRUST_SERVER_CERTIFICATE = _env_bool("AZURE_SQL_TRUST_SERVER_CERTIFICATE", True)
 AZURE_SQL_CONNECTION_TIMEOUT = _env_int("AZURE_SQL_CONNECTION_TIMEOUT", 60)
+_sql_q_timeout = _env("SQL_QUERY_TIMEOUT_S")
+SQL_QUERY_TIMEOUT_S = max(5, int(_sql_q_timeout)) if _sql_q_timeout else AZURE_SQL_CONNECTION_TIMEOUT
 AZURE_SQL_ODBC_RETRIES = _env_int("AZURE_SQL_ODBC_RETRIES", 4)
 AZURE_SQL_MARS_CONNECTION = _env_bool("AZURE_SQL_MARS_CONNECTION", True)
 AZURE_SQL_EVAL_LOG_RETRIES = _env_int("AZURE_SQL_EVAL_LOG_RETRIES", 3)
@@ -116,9 +157,40 @@ SQL_SCHEMA_CACHE_MAX_AGE_SEC = _env_int("SQL_SCHEMA_CACHE_MAX_AGE_SEC", 86400)
 # When cache file exists but is older than max age, use it unless this is true (avoids ODBC on every start).
 SQL_SCHEMA_FORCE_LIVE_REFRESH = _env_bool("SQL_SCHEMA_FORCE_LIVE_REFRESH", False)
 
+BENCH_RUNS = max(1, _env_int("BENCH_RUNS", 3))
+
+# AutoGen disk cache for LLM completions (.cache/{seed}); production default mirrors autogen (seed 41).
+LLM_RESPONSE_CACHE = _env_bool("LLM_RESPONSE_CACHE", False)
+LLM_RESPONSE_CACHE_SEED = _env_int("LLM_RESPONSE_CACHE_SEED", 41)
+LLM_RESPONSE_CACHE_DIR = _env("LLM_RESPONSE_CACHE_DIR") or ".cache"
+
+_bench_tol = _env("BENCH_CORRECTNESS_REL_TOLERANCE")
+BENCH_CORRECTNESS_REL_TOLERANCE = float(_bench_tol) if _bench_tol else 0.05
+SQL_MAX_REPAIR_ROUNDS = max(1, _env_int("SQL_MAX_REPAIR_ROUNDS", 2))
+ACCEPT_QUESTION_TIMEOUT_S = max(30, _env_int("ACCEPT_QUESTION_TIMEOUT_S", 120))
+ACCEPT_USE_WARM_WORKER = _env_bool("ACCEPT_USE_WARM_WORKER", True)
+ACCEPT_ISOLATE_SUBPROCESS = _env_bool("ACCEPT_ISOLATE_SUBPROCESS", False)
+ACCEPT_SUITE_TIMEOUT_S = max(300, _env_int("ACCEPT_SUITE_TIMEOUT_S", 5400))
+ACCEPT_CONSECUTIVE_FAIL_MAX = max(2, _env_int("ACCEPT_CONSECUTIVE_FAIL_MAX", 5))
+_accept_fail_rate = _env("ACCEPT_FAIL_RATE_MAX")
+ACCEPT_FAIL_RATE_MAX = float(_accept_fail_rate) if _accept_fail_rate else 0.25
+ACCEPT_MIN_ROWS_BEFORE_RATE = max(3, _env_int("ACCEPT_MIN_ROWS_BEFORE_RATE", 8))
+SQL_CATALOG_TTL_SEC = max(60, _env_int("SQL_CATALOG_TTL_SEC", 3600))
+SCHEMA_LINK_TOP_K = max(1, _env_int("SCHEMA_LINK_TOP_K", 8))
+SQL_DEFAULT_SCHEMA = _env("SQL_DEFAULT_SCHEMA") or "dbo"
+SQL_CATALOG_MIN_TABLES = max(10, _env_int("SQL_CATALOG_MIN_TABLES", 40))
+
 # AutoGen SQLite runtime log — off by default (writing info.db makes Streamlit reload mid-chat).
 AUTOGEN_RUNTIME_LOG_ENABLED = _env_bool("AUTOGEN_RUNTIME_LOG_ENABLED", False)
 AUTOGEN_RUNTIME_LOG_DB = _env("AUTOGEN_RUNTIME_LOG_DB") or str(_ROOT / ".cache" / "autogen_events.db")
+
+# ---------------------------------------------------------------------------
+# Request tracing (jev_trace.py — no hardcoded .loop/)
+# ---------------------------------------------------------------------------
+TRACE_PRINT_SUMMARY = _env_bool("TRACE_PRINT_SUMMARY", False)
+TRACE_PERSIST = _env_bool("TRACE_PERSIST", False)
+_trace_dir_default = str(_ROOT / ".cache" / "traces")
+TRACE_PERSIST_DIR = _env("TRACE_PERSIST_DIR") or _trace_dir_default
 
 # ---------------------------------------------------------------------------
 # UI / AutoGen paths
@@ -150,10 +222,32 @@ JEV_API_BASE = (_env("JEV_API_BASE") or "https://api.codiv.ai").rstrip("/")
 JEV_MODEL = _env("JEV_MODEL") or "openjev-latest"
 _jev_thresh = _env("JEV_CONFIDENCE_THRESHOLD")
 JEV_CONFIDENCE_THRESHOLD = float(_jev_thresh) if _jev_thresh else 0.8
+_jev_timeout = _env("JEV_TIMEOUT_MS")
+JEV_TIMEOUT_MS = max(100, int(_jev_timeout)) if _jev_timeout else 1500
+JEV_RETRY_MAX = max(0, _env_int("JEV_RETRY_MAX", 3))
+JEV_RETRY_BASE_MS = max(50, _env_int("JEV_RETRY_BASE_MS", 500))
+JEV_MAX_CONCURRENCY = max(1, _env_int("JEV_MAX_CONCURRENCY", 2))
+JEV_SHADOW_MODE = _env_bool("JEV_SHADOW_MODE", False)
 
 # Per-step toggles (all default False — existing LLM is always the fallback)
 JEV_ROUTING_ENABLED       = _env_bool("JEV_ROUTING_ENABLED",        False)  # S4
+ROUTING_LLM_FALLBACK      = _env_bool("ROUTING_LLM_FALLBACK",       False)
+SQL_S7_LLM_FALLBACK       = _env_bool("SQL_S7_LLM_FALLBACK",        False)
+SEMANTIC_QUERY_TRANSFORMER_LLM = _env_bool("SEMANTIC_QUERY_TRANSFORMER_LLM", False)
+RAI_LLM_FALLBACK          = _env_bool("RAI_LLM_FALLBACK",           False)
+_orchestrator = (_env("ORCHESTRATOR") or "pipeline").strip().lower()
+ORCHESTRATOR = _orchestrator if _orchestrator in ("pipeline", "groupchat") else "pipeline"
+DATA_PROFILE_PATH = _env("DATA_PROFILE_PATH") or ".cache/data_profile.json"
+S14_PII_REDACT_ENABLED = _env_bool("S14_PII_REDACT_ENABLED", True)
 JEV_S1_SAFETY_ENABLED     = _env_bool("JEV_S1_SAFETY_ENABLED",      False)
+# off | grey_zone | always — JEV+regex decide; grey uses RAI LLM only in grey zone (when grey_zone)
+SAFETY_LLM_MODE = (_env("SAFETY_LLM_MODE") or "always").strip().lower()
+if SAFETY_LLM_MODE not in ("off", "grey_zone", "always"):
+    SAFETY_LLM_MODE = "always"
+_s1_allow = _env("SAFETY_JEV_ALLOW_LOW")
+SAFETY_JEV_ALLOW_LOW = float(_s1_allow) if _s1_allow else 0.05
+_s1_block = _env("SAFETY_JEV_BLOCK_HIGH")
+SAFETY_JEV_BLOCK_HIGH = float(_s1_block) if _s1_block else 0.85
 JEV_S2_CLARITY_ENABLED    = _env_bool("JEV_S2_CLARITY_ENABLED",     False)
 JEV_S3_CACHE_ENABLED      = _env_bool("JEV_S3_CACHE_ENABLED",       False)
 JEV_S5_MODEL_ROUTER_ENABLED = _env_bool("JEV_S5_MODEL_ROUTER_ENABLED", False)
