@@ -228,6 +228,11 @@ JEV_RETRY_MAX = max(0, _env_int("JEV_RETRY_MAX", 3))
 JEV_RETRY_BASE_MS = max(50, _env_int("JEV_RETRY_BASE_MS", 500))
 JEV_MAX_CONCURRENCY = max(1, _env_int("JEV_MAX_CONCURRENCY", 2))
 JEV_SHADOW_MODE = _env_bool("JEV_SHADOW_MODE", False)
+PRESTAGE_PARALLEL_ENABLED = _env_bool("PRESTAGE_PARALLEL_ENABLED", True)
+PRESTAGE_WALL_S = max(1.0, float(_env_int("PRESTAGE_WALL_S", 8)))
+PRESTAGE_MAX_WORKERS = max(2, _env_int("PRESTAGE_MAX_WORKERS", 5))
+_prestage_arm = _env("PRESTAGE_ARM_TIMEOUT_S")
+PRESTAGE_ARM_TIMEOUT_S = float(_prestage_arm) if _prestage_arm else 0.0
 
 # Per-step toggles (all default False — existing LLM is always the fallback)
 JEV_ROUTING_ENABLED       = _env_bool("JEV_ROUTING_ENABLED",        False)  # S4

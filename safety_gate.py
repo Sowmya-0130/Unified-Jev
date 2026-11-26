@@ -31,6 +31,12 @@ class SafetyVerdict:
     )
 
 
+def regex_safety_blocks(question: str) -> bool:
+    """True when regex choke would block before JEV/SQL path (pre-stage network skip)."""
+    _flags, force_block = _regex_scan(question)
+    return force_block
+
+
 def _regex_scan(question: str) -> tuple[list[str], bool]:
     text = (question or "").lower()
     flags: list[str] = []

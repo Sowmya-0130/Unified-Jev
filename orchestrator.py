@@ -42,11 +42,14 @@ def run_sql_path(ctx: RequestContext, *, finish: Callable[..., dict]) -> dict:
     )
 
     gc = _proxy(ctx)
-    from sql_catalog import get_catalog_readonly
-    from schema_linker import linked_schema_block
     from API_unified import SCHEMA_LINK_TOP_K
+    from request_state import prestaged_schema_block
+    from schema_linker import linked_schema_block
+    from sql_catalog import get_catalog_readonly
 
-    schema = linked_schema_block(ctx.question, k=SCHEMA_LINK_TOP_K, catalog=get_catalog_readonly())
+    schema = prestaged_schema_block() or linked_schema_block(
+        ctx.question, k=SCHEMA_LINK_TOP_K, catalog=get_catalog_readonly()
+    )
     from sql_generator_prompt import SQL_GENERATOR_BASE
 
     pre = S4Preflight(handled=False, route=ctx.analysis_type or "SQL-based", next_agent="Sql_Generator", jev={})

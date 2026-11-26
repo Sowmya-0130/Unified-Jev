@@ -15,6 +15,10 @@ _DEFAULT_GUARD: dict[str, Any] = {
     "validation_repairs": 0,
     "jev_route": None,
     "jev_next_agent": None,
+    "prestaged_schema": None,
+    "safety_verdict": None,
+    "safety_blob": None,
+    "skip_rai_llm": False,
 }
 
 
@@ -100,3 +104,23 @@ def jev_route_next_agent() -> str | None:
 
 def jev_route_choice() -> str | None:
     return _guard().get("jev_route")
+
+
+def set_prestaged_schema(block: str | None) -> None:
+    b = (block or "").strip()
+    _guard()["prestaged_schema"] = b if b else None
+
+
+def prestaged_schema_block() -> str | None:
+    b = _guard().get("prestaged_schema")
+    if not b:
+        return None
+    return str(b)
+
+
+def safety_allows_sql_execute() -> bool:
+    """True after pre-chat safety verdict is not block (SQL path may proceed)."""
+    v = _guard().get("safety_verdict")
+    if v is None:
+        return False
+    return str(v) != "block"

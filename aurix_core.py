@@ -1017,6 +1017,16 @@ def db_execute_query(query: str = None, db_name: str = None) -> str:
     if db_name != "SQL":
         return "Invalid database name provided. Please use 'SQL'."
 
+    from request_state import safety_allows_sql_execute
+
+    if not safety_allows_sql_execute():
+        return json.dumps(
+            {
+                "error": "SQL execution blocked until pre-chat safety allows the request.",
+                "status": "safety_gate",
+            }
+        )
+
     _db_t0 = _time.perf_counter()
     _out: str = ""
 
@@ -2036,8 +2046,7 @@ def _get_final_answer_impl(question):
     set_request_question(question)
     _reset_sql_loop_guard(request_id)
     ensure_guard_request_id(request_id)
-    from API_unified import ORCHESTRATOR, SCHEMA_LINK_TOP_K
-    from schema_linker import linked_schema_block
+    from API_unified import ORCHESTRATOR
 
     from catalog_runtime import bootstrap_catalog
 
@@ -2054,32 +2063,33 @@ def _get_final_answer_impl(question):
     from concurrent.futures import ThreadPoolExecutor
 
     from API_unified import SAFETY_LLM_MODE
+    from prestage import record_prestage_trace, run_prestage
+    from request_state import set_prestaged_schema
     from safety_gate import (
         blocked_response,
         build_azure_safety_payload,
         evaluate_safety,
-        jev_s1_for_question,
         log_s1_gate,
+        regex_safety_blocks,
         set_prechat_verdict,
     )
 
-    def _timed_s1() -> dict | None:
-        if not JEV_S1_SAFETY_ENABLED:
-            return None
-        from jev_client import jev_safety_check
-        from jev_trace import jev_timed
+    _pre = run_prestage(
+        question,
+        schema_summary=SQL_Meta_Data,
+        answer_cache=_answer_cache,
+        network_arms=not regex_safety_blocks(question),
+    )
+    record_prestage_trace(_pre)
+    set_prestaged_schema(_pre.schema_block)
+    _jev_s1 = _pre.jev_s1
+    if not _pre.data_profile_refreshed:
+        try:
+            from data_profile import refresh_data_profile
 
-        return jev_timed("S1", lambda: jev_safety_check(question))
-
-    _jev_s1 = None
-    if JEV_S1_SAFETY_ENABLED:
-        _jev_s1 = _timed_s1()
-    try:
-        from data_profile import refresh_data_profile
-
-        refresh_data_profile()
-    except Exception:  # noqa: BLE001
-        pass
+            refresh_data_profile()
+        except Exception:  # noqa: BLE001
+            pass
     _verdict = evaluate_safety(question, jev=_jev_s1)
     log_s1_gate(_verdict, question)
     _safety_payload = build_azure_safety_payload(question, _verdict)
@@ -2160,9 +2170,13 @@ def _get_final_answer_impl(question):
             blocked_response(_verdict, question),
             termination_reason=_term,
         )
+    if _pre.cache_response:
+        return _finish_trace(_pre.cache_response, termination_reason="jev_s3_cache_hit")
     from routing_s4 import preflight_s4
 
-    _s4 = preflight_s4(question, schema_summary=SQL_Meta_Data)
+    _s4 = _pre.s4
+    if _s4 is None:
+        _s4 = preflight_s4(question, schema_summary=SQL_Meta_Data)
     if _s4.handled and _s4.finish_response:
         return _finish_trace(_s4.finish_response, termination_reason="s4_both_preflight")
     if _s4.route and _s4.next_agent:
@@ -2263,16 +2277,17 @@ def _get_final_answer_impl(question):
         _both = both_independent_answer(question, parallel=True)
         return _finish_trace(_both, termination_reason="both_independent")
 
-    # --- S3: Semantic cache check (handled later in this function, cache dict at module level) ---
-    if JEV_S3_CACHE_ENABLED:
+    # --- S3: fallback if parallel cache arm timed out ---
+    if JEV_S3_CACHE_ENABLED and not _pre.cache_scan_complete:
         from jev_client import jev_cache_intent_match
+
         for _cq, _cr in list(_answer_cache.items()):
             try:
                 _cm = jev_cache_intent_match(question, _cq)
                 if _cm["source"] == "openjev" and _cm.get("is_match", 0.0) > 0.85:
                     _cr_copy = dict(_cr)
                     _cr_copy["jev_cache_hit"] = True
-                    return _finish_trace(_cr_copy)
+                    return _finish_trace(_cr_copy, termination_reason="jev_s3_cache_hit")
             except Exception:  # noqa: BLE001
                 pass
 

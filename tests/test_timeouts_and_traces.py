@@ -60,6 +60,9 @@ def test_db_execute_query_surfaces_sql_timeout(monkeypatch):
     monkeypatch.setattr("sql_catalog.get_catalog_readonly", lambda: SimpleNamespace(display_names={}))
     monkeypatch.setattr("sql_pipeline.validate_sql", lambda *_a, **_k: _ok)
     monkeypatch.setattr(metadata, "fetch_dataframe_readonly", _boom)
+    from request_state import safety_prechat_store
+
+    safety_prechat_store("sql-timeout-test", "allow", {})
     out = core.db_execute_query(query="SELECT 1", db_name="SQL")
     assert "SQL_QUERY_TIMEOUT_S" in out
 
