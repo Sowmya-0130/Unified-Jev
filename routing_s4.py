@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 RouteChoice = Literal["SQL-based", "Semantic-based", "Both", "Both-independent", "Both-dependent"]
+BothLeg = Literal["sql", "semantic"]
 
 
 @dataclass
@@ -15,6 +16,22 @@ class S4Preflight:
     next_agent: str | None = None
     jev: dict[str, Any] | None = None
     low_confidence_both: bool = False
+
+
+def _s4_mark_both_independent(
+    *,
+    jev: dict[str, Any] | None = None,
+    low_confidence_both: bool = False,
+) -> S4Preflight:
+    """Route Both without running both_independent_answer (deferred to aurix_core)."""
+    return S4Preflight(
+        handled=True,
+        finish_response=None,
+        route="Both-independent",
+        next_agent="Both_handler",
+        jev=jev,
+        low_confidence_both=low_confidence_both,
+    )
 
 
 def jev_s4_decision(question: str, schema_summary: str) -> dict[str, Any]:
@@ -32,12 +49,7 @@ def preflight_s4(question: str, *, schema_summary: str) -> S4Preflight:
     from dual_route import infer_dual_route, next_agent_for_route
 
     if infer_dual_route(question) == "Both-independent":
-        from both_answer import both_independent_answer
-
-        return S4Preflight(
-            handled=True,
-            finish_response=both_independent_answer(question, parallel=True),
-        )
+        return _s4_mark_both_independent()
 
     if not JEV_ROUTING_ENABLED or ROUTING_LLM_FALLBACK:
         return S4Preflight(handled=False)
@@ -51,8 +63,6 @@ def preflight_s4(question: str, *, schema_summary: str) -> S4Preflight:
         return S4Preflight(handled=False, jev=jev)
     low_conf = conf < JEV_CONFIDENCE_THRESHOLD
     if low_conf:
-        from both_answer import both_independent_answer
-
         log_gate_decision(
             "S4",
             input_summary={"question_len": len(question), "schema_chars": len(schema_summary)},
@@ -62,12 +72,7 @@ def preflight_s4(question: str, *, schema_summary: str) -> S4Preflight:
             action="skip_llm",
             fallback_reason="low_confidence_both_parallel",
         )
-        return S4Preflight(
-            handled=True,
-            finish_response=both_independent_answer(question, parallel=True),
-            low_confidence_both=True,
-            jev=jev,
-        )
+        return _s4_mark_both_independent(jev=jev, low_confidence_both=True)
 
     log_gate_decision(
         "S4",
@@ -78,13 +83,7 @@ def preflight_s4(question: str, *, schema_summary: str) -> S4Preflight:
         action="skip_llm",
     )
     if choice.startswith("Both"):
-        from both_answer import both_independent_answer
-
-        return S4Preflight(
-            handled=True,
-            finish_response=both_independent_answer(question, parallel=True),
-            jev=jev,
-        )
+        return _s4_mark_both_independent(jev=jev)
 
     next_ag = next_agent_for_route(choice)
     if next_ag == "Both_handler":
@@ -95,6 +94,32 @@ def preflight_s4(question: str, *, schema_summary: str) -> S4Preflight:
         next_agent=next_ag,
         jev=jev,
     )
+
+
+def preflight_both_leg(
+    question: str,
+    *,
+    leg: Literal["sql", "semantic"] | None = None,
+) -> S4Preflight:
+    """Local route for SQL vs semantic half (no JEV HTTP)."""
+    from dual_route import infer_dual_route, is_document_only_question
+
+    if leg == "semantic":
+        return S4Preflight(handled=False, route="Semantic-based", next_agent="Eryl_agent")
+    if leg == "sql":
+        return S4Preflight(handled=False, route="SQL-based", next_agent="Sql_Generator")
+
+    q = (question or "").strip()
+    if is_document_only_question(q):
+        return S4Preflight(handled=False, route="Semantic-based", next_agent="Eryl_agent")
+
+    if infer_dual_route(question) == "Both-independent":
+        return _s4_mark_both_independent()
+    from dual_route import _SQL_INTENT, catalog_supports_sql
+
+    if bool(_SQL_INTENT.search(q)) or catalog_supports_sql(q):
+        return S4Preflight(handled=False, route="SQL-based", next_agent="Sql_Generator")
+    return S4Preflight(handled=False, route="Semantic-based", next_agent="Eryl_agent")
 
 
 def append_synthetic_routing(groupchat: Any, question: str, pre: S4Preflight) -> None:

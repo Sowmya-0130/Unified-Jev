@@ -10,6 +10,13 @@ _AGENT_GEN_LOCK = threading.Lock()
 
 
 def agent_llm_turn(agent: Any, user_prompt: str, *, sender: Any) -> str:
+    name = getattr(agent, "name", None) or type(agent).__name__
+    try:
+        from jev_trace import trace_stdout
+
+        trace_stdout(f"LLM turn: {name}…")
+    except Exception:  # noqa: BLE001
+        pass
     mark_agent_transition(agent)
     with _AGENT_GEN_LOCK:
         reply = agent.generate_reply(
@@ -17,4 +24,10 @@ def agent_llm_turn(agent: Any, user_prompt: str, *, sender: Any) -> str:
             sender=sender,
         )
     mark_agent_transition(agent)
+    try:
+        from jev_trace import trace_stdout
+
+        trace_stdout(f"LLM turn: {name} done ({len(str(reply or ''))} chars)")
+    except Exception:  # noqa: BLE001
+        pass
     return str(reply or "")

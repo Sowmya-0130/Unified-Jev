@@ -91,8 +91,9 @@ def build_insight_from_sql_result(
                     "executed_sql": ex,
                     "python_code": None,
                 }
+            question = _request_question()
             out = {
-                "query_answer": _format_number(scalar),
+                "query_answer": format_prose_scalar(question, scalar),
                 "inference": "Single-value result from executed SQL.",
                 "executed_sql": ex,
                 "python_code": None,
@@ -101,14 +102,35 @@ def build_insight_from_sql_result(
                 return None
             return out
 
+    if len(rows) == 1 and len(rows[0]) > 1:
+        question = _request_question()
+        prose = format_prose_from_row(question, rows[0])
+        from sql_pipeline import validate_insight_schema
+
+        out = {
+            "query_answer": prose,
+            "inference": "Single row with metrics from executed SQL.",
+            "executed_sql": ex,
+            "python_code": None,
+        }
+        if validate_insight_schema(out):
+            return None
+        return out
+
     if len(rows) <= 8 and _is_simple_list(rows):
-        lines = []
-        for i, row in enumerate(rows, 1):
-            parts = [f"{k}: {v}" for k, v in row.items()]
-            lines.append(f"{i}. " + ", ".join(parts))
+        question = _request_question()
+        if len(rows) == 1:
+            prose = format_prose_from_row(question, rows[0])
+        else:
+            intro = f"**{(question or 'Results').rstrip('?')}**\n\n"
+            bullets = []
+            for row in rows:
+                prose = format_prose_from_row("", row).replace("**", "")
+                bullets.append(f"- {prose.strip()}")
+            prose = intro + "\n".join(bullets)
         return {
-            "query_answer": "\n".join(lines),
-            "inference": f"Listed {len(rows)} row(s) from SQL.",
+            "query_answer": prose,
+            "inference": f"Summarized {len(rows)} row(s) from SQL.",
             "executed_sql": ex,
             "python_code": None,
         }
@@ -121,6 +143,92 @@ def _format_number(val: float | int) -> str:
     if isinstance(val, float):
         return re.sub(r"\.?0+$", "", f"{val:.6f}".rstrip("0").rstrip("."))
     return str(val)
+
+
+def _format_number_locale(val: float | int) -> str:
+    s = _format_number(val)
+    if "." in s:
+        whole, frac = s.split(".", 1)
+    else:
+        whole, frac = s, ""
+    neg = whole.startswith("-")
+    if neg:
+        whole = whole[1:]
+    with_commas = f"{int(whole):,}" if whole.isdigit() else whole
+    out = f"{'-' if neg else ''}{with_commas}"
+    return f"{out}.{frac}" if frac else out
+
+
+def _human_metric_label(col_name: str) -> str:
+    name = (col_name or "").replace("_", " ").strip()
+    low = name.lower()
+    if "total" in low and "amount" in low:
+        return "total order amount"
+    if low in ("total", "sum", "metric"):
+        return "total"
+    return name.lower() if name else "result"
+
+
+def _request_question() -> str:
+    try:
+        from jev_trace import get_request_question
+
+        return (get_request_question() or "").strip()
+    except ImportError:
+        return ""
+
+
+def format_prose_from_row(question: str, row: dict[str, Any]) -> str:
+    """Chat-style answer from one result row (no raw key: value dump)."""
+    q = (question or "").strip().rstrip("?").strip()
+    amount_val: Any = None
+    amount_key = ""
+    count_val: Any = None
+    for k, v in row.items():
+        kl = k.lower()
+        if v is None:
+            continue
+        if "count" in kl and count_val is None and isinstance(v, (int, float)):
+            count_val = v
+            continue
+        if amount_val is None and isinstance(v, (int, float)):
+            if any(t in kl for t in ("total", "amount", "sum", "avg", "metric", "revenue")):
+                amount_val, amount_key = v, k
+            elif not any("count" in x.lower() for x in row) or len(row) == 1:
+                amount_val, amount_key = v, k
+    if amount_val is None:
+        for k, v in row.items():
+            if "count" not in k.lower() and isinstance(v, (int, float)):
+                amount_val, amount_key = v, k
+                break
+
+    lines: list[str] = []
+    if q:
+        lines.append(f"**{q}**")
+        lines.append("")
+    if amount_val is not None:
+        label = _human_metric_label(amount_key)
+        lines.append(
+            f"The {label} is **{_format_number_locale(float(amount_val))}**."
+        )
+    if count_val is not None:
+        n = int(count_val)
+        noun = "order" if n == 1 else "orders"
+        lines.append(f"This is based on **{n:,}** matching {noun} in the database.")
+    if not lines or (q and len(lines) <= 2 and amount_val is None):
+        parts = [f"{_human_metric_label(k)}: {_format_number_locale(v)}" for k, v in row.items() if v is not None]
+        if q:
+            return f"**{q}**\n\n" + " ".join(parts) + "."
+        return " ".join(parts) + "."
+    return "\n".join(lines)
+
+
+def format_prose_scalar(question: str, scalar: float | int) -> str:
+    q = (question or "").strip().rstrip("?").strip()
+    val = _format_number_locale(scalar)
+    if q:
+        return f"**{q}**\n\nThe answer is **{val}**."
+    return f"The answer is **{val}**."
 
 
 _AGG_EMPTY_RE = re.compile(r"\b(SUM|COUNT|AVG|MIN|MAX)\s*\(", re.IGNORECASE)

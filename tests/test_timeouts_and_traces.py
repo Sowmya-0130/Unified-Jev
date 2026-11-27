@@ -123,8 +123,10 @@ def test_request_timeout_user_message(monkeypatch):
             t0 = time.perf_counter()
             resp = core.get_final_answer('{"question":"hi"}')
     assert time.perf_counter() - t0 <= float(API_unified.REQUEST_TIMEOUT_S) + 3.0
-    assert "REQUEST_TIMEOUT_S" in (resp.get("llm_answer") or "")
     assert resp.get("Reasoning") == "request_timeout"
+    user = (resp.get("llm_answer") or "").lower()
+    assert "too long" in user
+    assert "request_timeout_s" not in user
 
 
 def test_persist_request_trace_writes_file(tmp_path, monkeypatch):

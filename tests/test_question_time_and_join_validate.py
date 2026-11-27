@@ -47,3 +47,19 @@ def test_sql_has_date_predicate_detects_order_date():
         "WHERE Order_Date >= DATEADD(month,-2,GETDATE())",
         ["Order_Date"],
     )
+
+
+def test_calendar_year_filter_passes_validation():
+    cat = SqlCatalog(
+        tables={
+            ("dupoint_email_data", "orders"): {"Total_Amount", "Product_Name", "Order_Date"},
+        },
+        display_names={("dupoint_email_data", "orders"): ("dupoint_email_data", "Orders")},
+    )
+    sql = (
+        "SELECT SUM(Total_Amount) FROM [dupoint_email_data].[Orders] "
+        "WHERE Product_Name LIKE '%Kevlar%' AND YEAR(Order_Date) = 2025"
+    )
+    q = "Kevlar Gloves dupoint Orders in 2025"
+    vr = validate_sql(sql, cat, question=q)
+    assert vr.ok, (vr.error_class, vr.message)

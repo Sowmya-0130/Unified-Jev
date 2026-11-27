@@ -30,6 +30,14 @@ def split_both_question(question: str) -> tuple[str, str]:
     return left, right
 
 
+def is_document_only_question(question: str) -> bool:
+    """Doc/policy intent without explicit aggregate SQL wording (ignore weak catalog hits)."""
+    q = (question or "").strip()
+    if not q or not _DOC_INTENT.search(q):
+        return False
+    return not bool(_SQL_INTENT.search(q))
+
+
 def catalog_supports_sql(question: str) -> bool:
     from schema_linker import tables_mentioned_in_question, score_tables
     from sql_catalog import CatalogUnavailableError, get_catalog

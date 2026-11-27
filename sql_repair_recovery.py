@@ -47,10 +47,16 @@ def try_time_window_zero_from_generator_sql(groupchat: Any) -> int | None:
         sql = parse_sql_generator_query(msg.get("content"))
         if not sql:
             continue
+        catalog = get_catalog()
+        from sql_time_repair import try_patch_missing_time_predicate
+
+        patched = try_patch_missing_time_predicate(sql, question, catalog)
+        if patched:
+            sql = patched
         count_sql = build_filter_count_sql(sql)
         if not count_sql:
             continue
-        vr = validate_sql(count_sql, get_catalog(), question=question)
+        vr = validate_sql(count_sql, catalog, question=question)
         if not vr.ok:
             continue
         executed = vr.normalized_sql or count_sql

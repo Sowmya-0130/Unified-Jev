@@ -40,11 +40,13 @@ def run_validated_sql(sql: str | None, *, question: str | None = None) -> tuple[
             question = get_request_question() or None
         except ImportError:
             pass
-    vr = validate_sql(sql, get_catalog(), question=question)
-    if not vr.ok:
+    from sql_deterministic_repair import repair_sql_until_valid
+
+    catalog = get_catalog()
+    to_run, normalized = repair_sql_until_valid(sql, question, catalog)
+    if not to_run:
         return None, None
-    executed = vr.normalized_sql or sql
-    return executed, executed
+    return to_run, normalized or to_run
 
 
 def validation_error_body(sql: str | None, *, question: str | None = None) -> str:

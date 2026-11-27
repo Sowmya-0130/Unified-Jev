@@ -202,6 +202,14 @@ def _jev_post(state: str, questions: dict) -> dict | None:
                 wait_s = _parse_retry_after(resp) or (base_ms / 1000.0 * (2**attempt))
                 _last_jev_failure = "http:429"
                 logger.warning("OpenJev HTTP 429; retry in %.2fs (attempt %s).", wait_s, attempt + 1)
+                try:
+                    from jev_trace import trace_stdout
+
+                    trace_stdout(
+                        f"OpenJev HTTP 429 — wait {wait_s:.1f}s (attempt {attempt + 1})"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 if attempt + 1 >= max_attempts:
                     break
                 time.sleep(wait_s)
@@ -427,6 +435,34 @@ def _heuristic_sql_result_check(sql_result: str) -> dict | None:
             "confidence": 0.9,
             "source": "heuristic",
         }
+    data: dict | list | None = None
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, (dict, list)):
+            data = parsed
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("sql_pipeline_error"):
+            return {
+                "is_valid": False,
+                "error_type": "validation",
+                "pipeline_validation": True,
+                "no_matching_data": False,
+                "confidence": 0.95,
+                "source": "heuristic",
+            }
+        if str(data.get("status") or "") == "safety_gate":
+            return {
+                "is_valid": False,
+                "error_type": "safety_gate",
+                "pipeline_validation": True,
+                "no_matching_data": False,
+                "confidence": 1.0,
+                "source": "heuristic",
+            }
+        if "sql_query" in data and "next_agent" in data:
+            return None
     lower = raw.lower()
     if (
         lower.startswith("error")
@@ -435,7 +471,6 @@ def _heuristic_sql_result_check(sql_result: str) -> dict | None:
         or "traceback" in lower[:300]
         or "hy000" in lower
         or "invalid object" in lower
-        or (raw.startswith("{") and "error" in raw[:400].lower())
     ):
         return {
             "is_valid": False,
@@ -444,7 +479,8 @@ def _heuristic_sql_result_check(sql_result: str) -> dict | None:
             "source": "heuristic",
         }
     try:
-        data = json.loads(raw)
+        if data is None:
+            data = json.loads(raw)
     except json.JSONDecodeError:
         return None
     if isinstance(data, dict) and "sql_query" in data:

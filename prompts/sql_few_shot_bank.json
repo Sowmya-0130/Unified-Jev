@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "scalar_sum_with_year",
+      "tags": ["total", "sum", "amount", "scalar", "time"],
+      "question_pattern": "\\b(total|sum|amount)\\b",
+      "catalog_hints": [],
+      "example_output": {
+        "initial_question": "What was the total amount in 2024?",
+        "analysis_type": "SQL-based",
+        "sql_question": "Scalar total for calendar year 2024",
+        "sql_query": "SELECT SUM([AmountColumn]) AS Total_Amount FROM [ExampleSchema].[ExampleTable] WHERE YEAR([DateColumn]) = 2024",
+        "db_name": "SQL",
+        "next_agent": "sql_execute"
+      }
+    },
+    {
+      "id": "row_count_year",
+      "tags": ["count", "how many", "time"],
+      "question_pattern": "\\b(count|how many)\\b",
+      "catalog_hints": [],
+      "example_output": {
+        "initial_question": "How many records were there in 2023?",
+        "analysis_type": "SQL-based",
+        "sql_question": "Count rows for year 2023",
+        "sql_query": "SELECT COUNT(*) AS Row_Count FROM [ExampleSchema].[ExampleTable] WHERE YEAR([DateColumn]) = 2023",
+        "db_name": "SQL",
+        "next_agent": "sql_execute"
+      }
+    },
+    {
+      "id": "filtered_scalar",
+      "tags": ["filter", "where", "product", "scalar"],
+      "question_pattern": "\\b(for|with|where)\\b",
+      "catalog_hints": [],
+      "example_output": {
+        "initial_question": "Total for product line X in the last 12 months",
+        "analysis_type": "SQL-based",
+        "sql_question": "Filtered scalar with date window",
+        "sql_query": "SELECT SUM([MetricColumn]) AS Total FROM [ExampleSchema].[ExampleTable] WHERE [CategoryColumn] = N'X' AND [DateColumn] >= DATEADD(month, -12, GETDATE())",
+        "db_name": "SQL",
+        "next_agent": "sql_execute"
+      }
+    },
+    {
+      "id": "group_breakdown",
+      "tags": ["by", "per", "group", "breakdown"],
+      "question_pattern": "\\b(by|per each|breakdown)\\b",
+      "catalog_hints": [],
+      "example_output": {
+        "initial_question": "Revenue by region for 2024",
+        "analysis_type": "SQL-based",
+        "sql_question": "Grouped metric by dimension",
+        "sql_query": "SELECT [GroupColumn], SUM([AmountColumn]) AS Total FROM [ExampleSchema].[ExampleTable] WHERE YEAR([DateColumn]) = 2024 GROUP BY [GroupColumn]",
+        "db_name": "SQL",
+        "next_agent": "sql_execute"
+      }
+    }
+  ]
+}

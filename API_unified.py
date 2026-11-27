@@ -81,6 +81,22 @@ _req_timeout = _env("REQUEST_TIMEOUT_S")
 REQUEST_TIMEOUT_S = max(60, int(_req_timeout)) if _req_timeout else 600
 REQUEST_LOCK_WAIT_S = max(5, _env_int("REQUEST_LOCK_WAIT_S", 30))
 AZURE_LLM_MAX_RETRIES = _env_int("AZURE_LLM_MAX_RETRIES", 2)
+
+
+def _parse_llm_price_per_1k(raw: str | None) -> list[float] | None:
+    if not raw:
+        return None
+    parts = [p.strip() for p in str(raw).split(",") if p.strip()]
+    if len(parts) != 2:
+        return None
+    try:
+        return [float(parts[0]), float(parts[1])]
+    except ValueError:
+        return None
+
+
+# AutoGen built-in cost table lacks Azure deployment IDs (e.g. gpt-5-mini-*); [0,0] silences the warning.
+AZURE_LLM_PRICE_PER_1K = _parse_llm_price_per_1k(_env("AZURE_LLM_PRICE_PER_1K")) or [0.0, 0.0]
 AZURE_LLM_PREFLIGHT_ENABLED = _env_bool("AZURE_LLM_PREFLIGHT_ENABLED", False)
 # Fast chat probe before AutoGen (clear message on 401/DNS; not the old DNS-only UI block).
 AZURE_OPENAI_PROBE_BEFORE_CHAT = _env_bool("AZURE_OPENAI_PROBE_BEFORE_CHAT", False)
@@ -167,6 +183,11 @@ LLM_RESPONSE_CACHE_DIR = _env("LLM_RESPONSE_CACHE_DIR") or ".cache"
 _bench_tol = _env("BENCH_CORRECTNESS_REL_TOLERANCE")
 BENCH_CORRECTNESS_REL_TOLERANCE = float(_bench_tol) if _bench_tol else 0.05
 SQL_MAX_REPAIR_ROUNDS = max(1, _env_int("SQL_MAX_REPAIR_ROUNDS", 2))
+SQL_FEW_SHOT_ENABLED = _env_bool("SQL_FEW_SHOT_ENABLED", True)
+SQL_FEW_SHOT_MAX = max(0, min(8, _env_int("SQL_FEW_SHOT_MAX", 3)))
+SQL_FEW_SHOT_BANK_VERSION = max(1, _env_int("SQL_FEW_SHOT_BANK_VERSION", 1))
+_sql_reasoning = (_env("SQL_GENERATOR_REASONING_EFFORT") or "low").strip()
+SQL_GENERATOR_REASONING_EFFORT = _sql_reasoning if _sql_reasoning.lower() not in ("", "none", "off") else ""
 ACCEPT_QUESTION_TIMEOUT_S = max(30, _env_int("ACCEPT_QUESTION_TIMEOUT_S", 120))
 ACCEPT_USE_WARM_WORKER = _env_bool("ACCEPT_USE_WARM_WORKER", True)
 ACCEPT_ISOLATE_SUBPROCESS = _env_bool("ACCEPT_ISOLATE_SUBPROCESS", False)
@@ -187,7 +208,7 @@ AUTOGEN_RUNTIME_LOG_DB = _env("AUTOGEN_RUNTIME_LOG_DB") or str(_ROOT / ".cache" 
 # ---------------------------------------------------------------------------
 # Request tracing (jev_trace.py — no hardcoded .loop/)
 # ---------------------------------------------------------------------------
-TRACE_PRINT_SUMMARY = _env_bool("TRACE_PRINT_SUMMARY", False)
+TRACE_PRINT_SUMMARY = _env_bool("TRACE_PRINT_SUMMARY", True)
 TRACE_PERSIST = _env_bool("TRACE_PERSIST", False)
 _trace_dir_default = str(_ROOT / ".cache" / "traces")
 TRACE_PERSIST_DIR = _env("TRACE_PERSIST_DIR") or _trace_dir_default
@@ -233,6 +254,11 @@ PRESTAGE_WALL_S = max(1.0, float(_env_int("PRESTAGE_WALL_S", 8)))
 PRESTAGE_MAX_WORKERS = max(2, _env_int("PRESTAGE_MAX_WORKERS", 5))
 _prestage_arm = _env("PRESTAGE_ARM_TIMEOUT_S")
 PRESTAGE_ARM_TIMEOUT_S = float(_prestage_arm) if _prestage_arm else 0.0
+ASYNC_POSTCHECKS_ENABLED = _env_bool("ASYNC_POSTCHECKS_ENABLED", False)
+ASYNC_POSTCHECKS_TIMEOUT_S = max(1.0, float(_env_int("ASYNC_POSTCHECKS_TIMEOUT_S", 30)))
+MERGE_NODE_ENABLED = _env_bool("MERGE_NODE_ENABLED", True)
+MERGE_NODE_TIMEOUT_S = max(0.5, float(_env_int("MERGE_NODE_TIMEOUT_S", 5)))
+MERGE_NODE_MODEL = (_env("MERGE_NODE_MODEL") or "").strip() or None
 
 # Per-step toggles (all default False — existing LLM is always the fallback)
 JEV_ROUTING_ENABLED       = _env_bool("JEV_ROUTING_ENABLED",        False)  # S4
@@ -243,6 +269,7 @@ RAI_LLM_FALLBACK          = _env_bool("RAI_LLM_FALLBACK",           False)
 _orchestrator = (_env("ORCHESTRATOR") or "pipeline").strip().lower()
 ORCHESTRATOR = _orchestrator if _orchestrator in ("pipeline", "groupchat") else "pipeline"
 DATA_PROFILE_PATH = _env("DATA_PROFILE_PATH") or ".cache/data_profile.json"
+DATA_PROFILE_REFRESH_EACH_REQUEST = _env_bool("DATA_PROFILE_REFRESH_EACH_REQUEST", False)
 S14_PII_REDACT_ENABLED = _env_bool("S14_PII_REDACT_ENABLED", True)
 JEV_S1_SAFETY_ENABLED     = _env_bool("JEV_S1_SAFETY_ENABLED",      False)
 # off | grey_zone | always — JEV+regex decide; grey uses RAI LLM only in grey zone (when grey_zone)
@@ -255,6 +282,8 @@ _s1_block = _env("SAFETY_JEV_BLOCK_HIGH")
 SAFETY_JEV_BLOCK_HIGH = float(_s1_block) if _s1_block else 0.85
 JEV_S2_CLARITY_ENABLED    = _env_bool("JEV_S2_CLARITY_ENABLED",     False)
 JEV_S3_CACHE_ENABLED      = _env_bool("JEV_S3_CACHE_ENABLED",       False)
+JEV_S3_CACHE_VERSION      = (_env("JEV_S3_CACHE_VERSION") or "").strip()
+STREAMING_ENABLED         = _env_bool("STREAMING_ENABLED", False)
 JEV_S5_MODEL_ROUTER_ENABLED = _env_bool("JEV_S5_MODEL_ROUTER_ENABLED", False)
 JEV_S6_SQL_GUARD_ENABLED  = _env_bool("JEV_S6_SQL_GUARD_ENABLED",   False)
 JEV_S7_SQL_RESULT_ENABLED = _env_bool("JEV_S7_SQL_RESULT_ENABLED",  False)

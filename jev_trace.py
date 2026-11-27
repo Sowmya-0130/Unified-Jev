@@ -160,6 +160,52 @@ def record_step(
         _st().pending_tool_jev_ms += float(row["duration_ms"])
 
 
+def get_trace_t0() -> float:
+    return float(_st().t0)
+
+
+def use_request_trace(request_id: str, *, t0: float | None = None) -> None:
+    """Bind pipeline worker thread to the same request clock as pre-chat on main."""
+    st = _st()
+    st.request_id = str(request_id or "")
+    if t0 is not None and t0 > 0:
+        st.t0 = float(t0)
+    if st.t0 <= 0:
+        st.t0 = time.perf_counter()
+    st.segment_start = time.perf_counter()
+
+
+def peel_main_thread_trace() -> dict[str, Any]:
+    """Pre-chat timeline/gates recorded on the main thread (prestage, safety, Azure refresh)."""
+    lat = summarize_latency()
+    return {
+        "request_id": lat.get("request_id"),
+        "timeline": list(lat.get("timeline") or []),
+        "gate_decisions": list(lat.get("gate_decisions") or []),
+    }
+
+
+def merge_traces_into_response(resp: dict[str, Any], prefix: dict[str, Any]) -> dict[str, Any]:
+    """Merge main-thread pre-chat steps into jev_trace produced on the pipeline worker."""
+    if not prefix.get("timeline") and not prefix.get("gate_decisions"):
+        return resp
+    jt = dict(resp.get("jev_trace") or {})
+    lat = dict(jt.get("latency") or {})
+    merged_tl = list(prefix.get("timeline") or []) + list(lat.get("timeline") or [])
+    merged_tl.sort(key=lambda s: float(s.get("t_ms") or 0))
+    lat["timeline"] = merged_tl
+    lat["gate_decisions"] = list(prefix.get("gate_decisions") or []) + list(
+        lat.get("gate_decisions") or []
+    )
+    rid = prefix.get("request_id") or lat.get("request_id")
+    if rid:
+        jt["request_id"] = rid
+        lat["request_id"] = rid
+    jt["latency"] = lat
+    resp["jev_trace"] = jt
+    return resp
+
+
 def begin_chat_phase() -> None:
     """Start agent-segment timing at initiate_chat (excludes pre-chat setup)."""
     _st().chat_phase_started = True
@@ -475,6 +521,16 @@ def summarize_latency() -> dict[str, Any]:
             c.get("response_id") for c in _st().llm_api_calls if c.get("response_id")
         ],
     }
+
+
+def trace_stdout(message: str) -> None:
+    """Live progress line in the terminal (Streamlit / CLI), when TRACE_PRINT_SUMMARY=true."""
+    from API_unified import TRACE_PRINT_SUMMARY
+
+    if not TRACE_PRINT_SUMMARY:
+        return
+    rid = (_st().request_id or "?")[:12]
+    print(f"[AURIX {rid}] {message}", flush=True)
 
 
 def print_latency_summary(summary: dict[str, Any] | None = None) -> None:

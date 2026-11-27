@@ -6,6 +6,9 @@ from typing import Any
 
 _TLS = threading.local()
 
+# Main thread sets safety at pre-chat; pipeline Sql_tool runs on a worker thread.
+_SAFETY_BY_REQUEST: dict[str, dict[str, Any]] = {}
+
 _DEFAULT_GUARD: dict[str, Any] = {
     "request_id": None,
     "result_fp": None,
@@ -70,17 +73,59 @@ def ensure_guard_request_id(request_id: str | None) -> None:
     g["skip_rai_llm"] = False
 
 
+def inherit_prechat_safety(child_request_id: str, parent_request_id: str) -> bool:
+    """Copy allow/block store from parent Both request onto a nested leg (no extra JEV S1)."""
+    parent = _SAFETY_BY_REQUEST.get(str(parent_request_id))
+    if not parent:
+        return False
+    action = str(parent.get("verdict") or "block")
+    blob = dict(parent.get("blob") or {})
+    skip_rai = bool(parent.get("skip_rai_llm"))
+    _SAFETY_BY_REQUEST[str(child_request_id)] = {
+        "verdict": action,
+        "blob": blob,
+        "skip_rai_llm": skip_rai,
+    }
+    g = _guard()
+    g["request_id"] = child_request_id
+    g["safety_verdict"] = action
+    g["safety_blob"] = blob
+    g["skip_rai_llm"] = skip_rai
+    return action != "block"
+
+
 def safety_prechat_store(request_id: str, verdict_action: str, blob: dict) -> None:
+    from API_unified import SAFETY_LLM_MODE
+
+    skip_rai = verdict_action == "allow" and (
+        SAFETY_LLM_MODE == "off"
+        or (SAFETY_LLM_MODE == "grey_zone" and verdict_action == "allow")
+    )
+    _SAFETY_BY_REQUEST[str(request_id)] = {
+        "verdict": verdict_action,
+        "blob": dict(blob),
+        "skip_rai_llm": skip_rai,
+    }
     g = _guard()
     g["request_id"] = request_id
     g["safety_verdict"] = verdict_action
     g["safety_blob"] = blob
-    from API_unified import SAFETY_LLM_MODE
+    g["skip_rai_llm"] = skip_rai
 
-    g["skip_rai_llm"] = verdict_action == "allow" and (
-        SAFETY_LLM_MODE == "off"
-        or (SAFETY_LLM_MODE == "grey_zone" and verdict_action == "allow")
-    )
+
+def sync_safety_for_request(request_id: str | None) -> None:
+    """Copy pre-chat safety from main thread onto pipeline worker TLS."""
+    rid = str(request_id or "").strip()
+    if not rid:
+        return
+    snap = _SAFETY_BY_REQUEST.get(rid)
+    if not snap:
+        return
+    g = _guard()
+    g["request_id"] = rid
+    g["safety_verdict"] = snap.get("verdict")
+    g["safety_blob"] = snap.get("blob")
+    g["skip_rai_llm"] = bool(snap.get("skip_rai_llm"))
 
 
 def safety_skip_rai_llm() -> bool:
@@ -121,6 +166,17 @@ def prestaged_schema_block() -> str | None:
 def safety_allows_sql_execute() -> bool:
     """True after pre-chat safety verdict is not block (SQL path may proceed)."""
     v = _guard().get("safety_verdict")
+    if v is None:
+        try:
+            from jev_trace import snapshot
+
+            rid = (snapshot().get("request_id") or "").strip()
+            if rid:
+                snap = _SAFETY_BY_REQUEST.get(rid)
+                if snap:
+                    v = snap.get("verdict")
+        except ImportError:
+            pass
     if v is None:
         return False
     return str(v) != "block"

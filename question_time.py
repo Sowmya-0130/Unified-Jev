@@ -19,8 +19,12 @@ def parse_time_window(question: str) -> TimeWindow | None:
         return TimeWindow(kind="last_months", months=int(m.group(1)), raw_phrase=m.group(0))
     if re.search(r"\bthis\s+quarter\b", text, re.IGNORECASE):
         return TimeWindow(kind="this_quarter", raw_phrase="this quarter")
-    if re.search(r"\bin\s+20\d{2}\b", text, re.IGNORECASE):
-        return TimeWindow(kind="calendar_year", raw_phrase=re.search(r"\bin\s+20\d{2}\b", text, re.I).group(0))
+    m = re.search(r"\bin\s+20\d{2}\b", text, re.IGNORECASE)
+    if m:
+        return TimeWindow(kind="calendar_year", raw_phrase=m.group(0))
+    m = re.search(r"\b(?:for|during)\s+.{0,80}?\b(20\d{2})\b", text, re.IGNORECASE)
+    if m:
+        return TimeWindow(kind="calendar_year", raw_phrase=f"in {m.group(1)}")
     return None
 
 
@@ -30,6 +34,14 @@ def hint_line(window: TimeWindow, date_columns: list[str]) -> str:
         return (
             f"**Time filter (required):** question asks for `{window.raw_phrase}` — "
             f"SQL WHERE must filter using {cols} (e.g. DATEADD(month, -{window.months}, GETDATE()))."
+        )
+    if window.kind == "calendar_year":
+        m = re.search(r"(20\d{2})", window.raw_phrase or "")
+        year = m.group(1) if m else "YYYY"
+        return (
+            f"**Time filter (required):** question asks for `{window.raw_phrase}` — "
+            f"SQL WHERE must filter using {cols} (e.g. YEAR(<col>) = {year} "
+            f"or <col> between '{year}-01-01' and '{year}-12-31')."
         )
     return f"**Time filter (required):** `{window.raw_phrase}` — SQL WHERE must use {cols}."
 
@@ -47,6 +59,8 @@ def date_columns_from_catalog(question: str, catalog, table_keys: list[tuple[str
 
 def sql_has_date_predicate(sql: str, date_columns: list[str]) -> bool:
     low = (sql or "").lower()
+    if re.search(r"\byear\s*\(", low):
+        return True
     if any(fn in low for fn in ("dateadd", "datediff", "getdate", "current_timestamp")):
         return True
     if re.search(r"\bbetween\b", low) and re.search(r"date", low):

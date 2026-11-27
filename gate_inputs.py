@@ -87,8 +87,12 @@ def latest_sql_tool_result(messages: list[dict]) -> tuple[str, int]:
     return "", -1
 
 
-def s7_input(sql_tool_message: str, *, message_index: int | None = None) -> dict[str, int]:
-    out: dict[str, int] = {"sql_out_chars": len(str(sql_tool_message or ""))}
+def s7_input(sql_tool_message: str, *, message_index: int | None = None) -> dict[str, Any]:
+    raw = str(sql_tool_message or "")
+    out: dict[str, Any] = {
+        "sql_out_chars": len(raw),
+        "sql_tool_preview": raw[:200],
+    }
     if message_index is not None and message_index >= 0:
         out["sql_tool_msg_index"] = message_index
     return out

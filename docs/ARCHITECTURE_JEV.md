@@ -57,11 +57,11 @@ Per-request: `request_context.RequestContext` (transcript only for that request)
 | **A1** | Code orchestrator (`ORCHESTRATOR=pipeline`) |
 | A2 | Parallel pre-stage (S1∥S4∥schema∥cache∥prefetch) |
 | A3 | Post-checks off critical path |
-| A4 | Direct retriever (no Eryl LLM) |
-| A5 | Honest / clarity / timeout exits |
-| A6 | SQL few-shot bank + reasoning_effort |
-| A7 | Versioned S3 cache |
-| A8 | Streaming first token |
+| A4 | Direct retriever (no Eryl LLM) → pipeline `retriever` + `extract_context` (done) |
+| A5 | Honest / clarity / timeout exits → **`pipeline_exits.py`** (done) |
+| A6 | SQL few-shot bank + reasoning_effort → **`sql_few_shot_bank.py`** (done) |
+| A7 | Versioned S3 cache → **`jev_s3_cache_version.py`** (done) |
+| A8 | Streaming first token → **`STREAMING_ENABLED`** + `main._display_answer_text` (done) |
 
 ## Conformance & acceptance
 

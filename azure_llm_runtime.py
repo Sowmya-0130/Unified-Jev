@@ -6,6 +6,8 @@ from openai import AzureOpenAI
 from azure_openai_endpoint import install_openai_dns_alias_patch, resolve_azure_openai_endpoint
 
 _PATCHED = False
+_CLIENT_SIG: str | None = None
+_CACHED_CLIENT: AzureOpenAI | None = None
 
 
 def ensure_openai_dns_patch() -> None:
@@ -39,19 +41,24 @@ def refresh_azure_openai_runtime(
 
     deployment = api.GPT4_LLM_MODEL_DEPLOYMENT_NAME
     entry = llm_config["config_list"][0]
-    entry.update(
-        {
-            "model": deployment,
-            "azure_deployment": deployment,
-            "api_type": "azure",
-            "base_url": endpoint,
-            "api_key": api_key,
-            "api_version": api.AZURE_OPENAI_API_VERSION,
-            "max_retries": api.AZURE_LLM_MAX_RETRIES,
-        }
-    )
+    patch = {
+        "model": deployment,
+        "azure_deployment": deployment,
+        "api_type": "azure",
+        "base_url": endpoint,
+        "api_key": api_key,
+        "api_version": api.AZURE_OPENAI_API_VERSION,
+        "max_retries": api.AZURE_LLM_MAX_RETRIES,
+    }
+    if api.AZURE_LLM_PRICE_PER_1K:
+        patch["price"] = list(api.AZURE_LLM_PRICE_PER_1K)
+    entry.update(patch)
     llm_config["timeout"] = api.AZURE_LLM_REQUEST_TIMEOUT
 
+    global _CLIENT_SIG, _CACHED_CLIENT
+    sig = f"{endpoint}|{deployment}|{api.AZURE_OPENAI_API_VERSION}|{api.AZURE_LLM_REQUEST_TIMEOUT}"
+    if _CLIENT_SIG == sig and _CACHED_CLIENT is not None:
+        return endpoint, _CACHED_CLIENT
     client = AzureOpenAI(
         api_key=api_key,
         api_version=api.AZURE_OPENAI_API_VERSION,
@@ -59,4 +66,6 @@ def refresh_azure_openai_runtime(
         timeout=api.AZURE_LLM_REQUEST_TIMEOUT,
         max_retries=api.AZURE_LLM_MAX_RETRIES,
     )
+    _CLIENT_SIG = sig
+    _CACHED_CLIENT = client
     return endpoint, client

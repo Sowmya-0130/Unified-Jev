@@ -139,7 +139,7 @@ def test_live_catalog_dupoint_orders_casing():
 
 @pytest.mark.live
 def test_live_validate_emits_orders_casing():
-    from sql_catalog import get_catalog
+    from tests.fixtures.catalog_golden import golden_catalog
 
     sql = "SELECT COUNT(*) AS n FROM [dupoint_email_data].[orders]"
     vr = validate_sql(sql, golden_catalog())

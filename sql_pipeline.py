@@ -209,7 +209,10 @@ def _question_expects_scalar_aggregate(question: str) -> bool:
         phrase in q
         for phrase in (
             "what is the total",
+            "what were the total",
             "combined total",
+            "order amounts",
+            "order amount",
             "how many rows",
             "how many ",
             "what is the average",

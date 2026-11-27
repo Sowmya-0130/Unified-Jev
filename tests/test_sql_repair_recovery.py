@@ -49,6 +49,36 @@ def test_validation_repair_counts_attempts_on_pipeline_error():
     assert nxt is core.Insight_Generator
 
 
+def test_time_window_zero_patches_calendar_year_before_count(monkeypatch):
+    from jev_trace import reset as trace_reset, set_request_question
+
+    trace_reset()
+    q = "total Total_Amount Kevlar dupoint Orders in 2025"
+    set_request_question(q)
+    sql = (
+        "SELECT SUM(Total_Amount) FROM [dupoint_email_data].[Orders] "
+        "WHERE Product_Name LIKE '%Kevlar%'"
+    )
+    gc = _GC([{"name": "Sql_Generator", "content": json.dumps({"sql_query": sql})}])
+    from sql_catalog import SqlCatalog
+
+    cat = SqlCatalog(
+        tables={
+            ("dupoint_email_data", "orders"): {"Total_Amount", "Product_Name", "Order_Date"},
+        },
+        display_names={("dupoint_email_data", "orders"): ("dupoint_email_data", "Orders")},
+    )
+    import pandas as pd
+
+    monkeypatch.setattr("sql_repair_recovery.get_catalog", lambda: cat)
+    with patch(
+        "sql_repair_recovery.fetch_dataframe_readonly",
+        lambda _sql: pd.DataFrame([{"match_row_count": 0}]),
+    ):
+        n = try_time_window_zero_from_generator_sql(gc)
+    assert n == 0
+
+
 def test_time_window_zero_from_groupby_sql(monkeypatch):
     from jev_trace import reset as trace_reset, set_request_question
 

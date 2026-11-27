@@ -83,6 +83,10 @@ def _scan_answer_cache(
     try:
         if question in answer_cache:
             hit = dict(answer_cache[question])
+            from jev_s3_cache_version import cache_entry_valid
+
+            if not cache_entry_valid(hit):
+                return None, (time.perf_counter() - t0) * 1000, "stale"
             hit["jev_cache_hit"] = True
             return hit, (time.perf_counter() - t0) * 1000, "ok"
         from jev_client import jev_cache_intent_match
@@ -92,6 +96,10 @@ def _scan_answer_cache(
                 match = jev_cache_intent_match(question, cached_q)
                 if match.get("source") == "openjev" and float(match.get("is_match") or 0.0) > 0.85:
                     hit = dict(cached_resp)
+                    from jev_s3_cache_version import cache_entry_valid
+
+                    if not cache_entry_valid(hit):
+                        continue
                     hit["jev_cache_hit"] = True
                     return hit, (time.perf_counter() - t0) * 1000, "ok"
             except Exception:  # noqa: BLE001
@@ -104,9 +112,13 @@ def _scan_answer_cache(
 def _refresh_profile() -> tuple[bool, float, str]:
     t0 = time.perf_counter()
     try:
-        from data_profile import refresh_data_profile
+        from API_unified import DATA_PROFILE_REFRESH_EACH_REQUEST
+        from data_profile import load_data_profile, refresh_data_profile
 
-        refresh_data_profile()
+        if DATA_PROFILE_REFRESH_EACH_REQUEST:
+            refresh_data_profile()
+        else:
+            load_data_profile()
         return True, (time.perf_counter() - t0) * 1000, "ok"
     except Exception:  # noqa: BLE001
         return False, (time.perf_counter() - t0) * 1000, "error"
@@ -123,6 +135,13 @@ def record_prestage_trace(result: PrestageResult) -> None:
             status=result.arm_status.get(arm, "ok"),
         )
     record_step("prestage", "wall", result.wall_ms, status="ok")
+    try:
+        from jev_trace import trace_stdout
+
+        arms = ", ".join(f"{k}={result.arm_status.get(k, '?')}" for k in sorted(result.arm_ms))
+        trace_stdout(f"prestage {result.wall_ms:.0f}ms ({arms})")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def run_prestage(

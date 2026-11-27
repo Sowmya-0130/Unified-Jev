@@ -36,6 +36,15 @@ def test_s7_error_text_invalid():
     assert out.get("error_type") == "unknown_error"
 
 
+def test_s7_sql_pipeline_error_is_validation_class():
+    from sql_execute_step import validation_error_body
+
+    body = validation_error_body("SELECT bad", question="q")
+    out = _heuristic_sql_result_check(body)
+    assert out and out.get("error_type") == "validation"
+    assert out.get("pipeline_validation")
+
+
 def test_s7_db_error_string_invalid():
     out = _heuristic_sql_result_check(
         "An error occurred while executing the query: ('42000', 'bad')"

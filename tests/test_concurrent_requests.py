@@ -42,6 +42,7 @@ def test_parallel_slow_requests_no_request_busy(monkeypatch):
 
     monkeypatch.setattr(API_unified, "ORCHESTRATOR", "pipeline")
     monkeypatch.setattr(API_unified, "REQUEST_TIMEOUT_S", 1)
+    monkeypatch.setattr(core, "REQUEST_TIMEOUT_S", 1, raising=False)
     monkeypatch.setattr(API_unified, "JEV_S1_SAFETY_ENABLED", False)
     monkeypatch.setattr(core, "JEV_S1_SAFETY_ENABLED", False, raising=False)
     monkeypatch.setattr(API_unified, "AZURE_OPENAI_PROBE_BEFORE_CHAT", False)
@@ -62,7 +63,10 @@ def test_parallel_slow_requests_no_request_busy(monkeypatch):
     )
     monkeypatch.setattr("safety_gate.evaluate_safety", lambda *a, **k: _allow)
     monkeypatch.setattr("safety_gate.log_s1_gate", lambda *_a, **_k: None)
-    monkeypatch.setattr("orchestrator.run_pipeline", lambda **k: time.sleep(30))
+    monkeypatch.setattr(
+        "orchestrator.run_pipeline",
+        lambda *a, **k: time.sleep(30),
+    )
     monkeypatch.setattr("catalog_runtime.bootstrap_catalog", lambda **k: None)
 
     _ctx = MagicMock(__enter__=lambda s: s, __exit__=lambda *a: False)

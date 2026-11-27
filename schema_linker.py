@@ -19,6 +19,9 @@ def _table_words_in_question(question: str) -> set[str]:
 
 def tables_mentioned_in_question(question: str, catalog: SqlCatalog) -> list[TableRef]:
     """Tables whose catalog name (or schema.name) appears in the question text."""
+    from question_sql_normalize import normalize_question_for_sql
+
+    question = normalize_question_for_sql(question)
     q = (question or "").lower()
     q_compact = q.replace(" ", "_").replace("-", "_")
     tw = _table_words_in_question(question)
@@ -46,6 +49,9 @@ def tables_mentioned_in_question(question: str, catalog: SqlCatalog) -> list[Tab
 
 
 def score_tables(question: str, catalog: SqlCatalog) -> list[tuple[float, TableRef]]:
+    from question_sql_normalize import normalize_question_for_sql
+
+    question = normalize_question_for_sql(question)
     qtok = _tokens(question)
     tw = _table_words_in_question(question)
     scored: list[tuple[float, TableRef]] = []

@@ -156,21 +156,64 @@ OpenAIWrapper._configure_azure_openai = _configure_azure_openai_preserve_dots
 from openai import AzureOpenAI
 
 # LLM Configuration
+_llm_entry: dict = {
+    "model": GPT4_LLM_MODEL_DEPLOYMENT_NAME,
+    "azure_deployment": GPT4_LLM_MODEL_DEPLOYMENT_NAME,
+    "api_type": "azure",
+    "base_url": AZURE_OPENAI_API_BASE,
+    "api_key": AZURE_OPENAI_API_KEY,
+    "api_version": AZURE_OPENAI_API_VERSION,
+    "max_retries": AZURE_LLM_MAX_RETRIES,
+}
+if AZURE_LLM_PRICE_PER_1K:
+    _llm_entry["price"] = list(AZURE_LLM_PRICE_PER_1K)
+
 llm_config = {
-    "config_list": [
-        {
-            "model": GPT4_LLM_MODEL_DEPLOYMENT_NAME,
-            "azure_deployment": GPT4_LLM_MODEL_DEPLOYMENT_NAME,
-            "api_type": "azure",
-            "base_url": AZURE_OPENAI_API_BASE,
-            "api_key": AZURE_OPENAI_API_KEY,
-            "api_version": AZURE_OPENAI_API_VERSION,
-            "max_retries": AZURE_LLM_MAX_RETRIES,
-        }
-    ],
+    "config_list": [_llm_entry],
     "temperature": AZURE_LLM_TEMPERATURE,
     "timeout": LLM_REQUEST_TIMEOUT_S,
 }
+
+
+def sql_generator_llm_config() -> dict:
+    """Sql_Generator-only settings (low reasoning effort when supported)."""
+    from API_unified import SQL_GENERATOR_REASONING_EFFORT
+
+    cfg = {
+        "config_list": [dict(_llm_entry)],
+        "temperature": AZURE_LLM_TEMPERATURE,
+        "timeout": LLM_REQUEST_TIMEOUT_S,
+    }
+    if SQL_GENERATOR_REASONING_EFFORT:
+        cfg["reasoning_effort"] = SQL_GENERATOR_REASONING_EFFORT
+    return cfg
+
+
+def sync_sql_generator_llm_from_shared() -> None:
+    """Keep Sql_Generator deployment/endpoint in sync after azure refresh."""
+    try:
+        src = llm_config["config_list"][0]
+        dst = Sql_Generator.llm_config["config_list"][0]
+        dst.update(
+            {
+                k: src[k]
+                for k in (
+                    "model",
+                    "azure_deployment",
+                    "api_type",
+                    "base_url",
+                    "api_key",
+                    "api_version",
+                    "max_retries",
+                )
+                if k in src
+            }
+        )
+        if "price" in src:
+            dst["price"] = list(src["price"])
+        Sql_Generator.llm_config["timeout"] = llm_config.get("timeout")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def apply_llm_response_cache_setting() -> None:
@@ -464,9 +507,9 @@ from sql_generator_prompt import SQL_GENERATOR_BASE
 Sql_Generator = AssistantAgent(
     name="Sql_Generator",
     system_message=SQL_GENERATOR_BASE + "\n(Schema linked at request time.)\n",
-max_consecutive_auto_reply=3,
-    llm_config=llm_config,
-    human_input_mode="NEVER"
+    max_consecutive_auto_reply=3,
+    llm_config=sql_generator_llm_config(),
+    human_input_mode="NEVER",
 )
 
 Query_Executor = AssistantAgent(
@@ -938,8 +981,8 @@ async def extract_context(question: str = None, vector_weight: float = 0.5, grap
             select=['documentId', 'content'],
             query_type=QueryType.SEMANTIC,
             semantic_configuration_name='my-semantic-config',
-            query_caption=QueryCaptionType.EXTRACTIVE,
-            query_answer=QueryAnswerType.EXTRACTIVE,
+            query_caption="extractive",
+            query_answer="extractive",
             top=3
         )
         return [result["content"] for result in results]
@@ -1198,12 +1241,15 @@ def state_transition(last_speaker, groupchat):
             _route = None
             if not _next:
                 _pf = preflight_s4(question, schema_summary=SQL_Meta_Data)
-                if _pf.handled:
+                if _pf.handled and _pf.finish_response:
                     from jev_trace import record_termination
 
                     record_termination("s4_both_preflight_unexpected_in_chat")
                     return user_proxy
-                _next = _pf.next_agent or "Sql_Generator"
+                if _pf.handled and _pf.route and str(_pf.route).startswith("Both"):
+                    _next = _pf.next_agent or "Both_handler"
+                else:
+                    _next = _pf.next_agent or "Sql_Generator"
                 append_synthetic_routing(groupchat, question, _pf)
             else:
                 from request_state import jev_route_choice
@@ -2020,7 +2066,13 @@ def get_final_answer(question):
     return _get_final_answer_impl(question)
 
 
-def _get_final_answer_impl(question):
+def _get_final_answer_impl(
+    question,
+    *,
+    both_nested: bool = False,
+    both_leg: str | None = None,
+    safety_parent_request_id: str | None = None,
+):
     global client, _AZURE_CHAT_PROBE_DONE, _AZURE_CHAT_PROBE_ERROR
 
     from azure_llm_runtime import refresh_azure_openai_runtime
@@ -2044,6 +2096,13 @@ def _get_final_answer_impl(question):
     from request_state import ensure_guard_request_id
 
     set_request_question(question)
+    try:
+        from jev_trace import trace_stdout
+
+        qprev = (question or "").strip().replace("\n", " ")[:72]
+        trace_stdout(f"started — {qprev!r}")
+    except Exception:  # noqa: BLE001
+        pass
     _reset_sql_loop_guard(request_id)
     ensure_guard_request_id(request_id)
     from API_unified import ORCHESTRATOR
@@ -2074,23 +2133,51 @@ def _get_final_answer_impl(question):
         set_prechat_verdict,
     )
 
+    _prestage_network = False if both_nested else not regex_safety_blocks(question)
     _pre = run_prestage(
         question,
         schema_summary=SQL_Meta_Data,
         answer_cache=_answer_cache,
-        network_arms=not regex_safety_blocks(question),
+        network_arms=_prestage_network,
     )
     record_prestage_trace(_pre)
     set_prestaged_schema(_pre.schema_block)
+    try:
+        from jev_trace import trace_stdout
+
+        trace_stdout("safety evaluation…")
+    except Exception:  # noqa: BLE001
+        pass
     _jev_s1 = _pre.jev_s1
     if not _pre.data_profile_refreshed:
         try:
-            from data_profile import refresh_data_profile
+            from data_profile import load_data_profile
 
-            refresh_data_profile()
+            load_data_profile()
         except Exception:  # noqa: BLE001
             pass
-    _verdict = evaluate_safety(question, jev=_jev_s1)
+    _inherited_nested_safety = False
+    if both_nested and safety_parent_request_id:
+        from request_state import inherit_prechat_safety
+
+        _inherited_nested_safety = inherit_prechat_safety(
+            request_id, safety_parent_request_id
+        )
+    if both_nested and safety_parent_request_id and not _inherited_nested_safety:
+        _verdict = evaluate_safety(question, jev=_jev_s1)
+    elif both_nested and _inherited_nested_safety:
+        _verdict = evaluate_safety(
+            question,
+            jev={
+                "source": "both_nested_inherit",
+                "is_toxic": 0.0,
+                "is_injection": 0.0,
+                "has_pii": 0.0,
+                "block": False,
+            },
+        )
+    else:
+        _verdict = evaluate_safety(question, jev=_jev_s1)
     log_s1_gate(_verdict, question)
     _safety_payload = build_azure_safety_payload(question, _verdict)
     set_prechat_verdict(request_id, _verdict, _safety_payload)
@@ -2162,27 +2249,69 @@ def _get_final_answer_impl(question):
 
         return apply_pii_redaction(resp)
 
+    if both_nested and safety_parent_request_id and not _inherited_nested_safety:
+        from safety_exit import response_for_safety_block
+
+        return _finish_trace(
+            response_for_safety_block(_verdict, question, "safety_blocked"),
+            termination_reason="safety_blocked",
+        )
+
     if _verdict.action == "block":
         _term = "safety_blocked"
         if any(str(r).startswith("jev_unavailable") for r in _verdict.reasons):
             _term = "safety_jev_unavailable"
+        from safety_exit import response_for_safety_block
+
         return _finish_trace(
-            blocked_response(_verdict, question),
+            response_for_safety_block(_verdict, question, _term),
             termination_reason=_term,
         )
     if _pre.cache_response:
         return _finish_trace(_pre.cache_response, termination_reason="jev_s3_cache_hit")
-    from routing_s4 import preflight_s4
+    from routing_s4 import preflight_both_leg, preflight_s4
 
     _s4 = _pre.s4
-    if _s4 is None:
-        _s4 = preflight_s4(question, schema_summary=SQL_Meta_Data)
+    if both_nested and both_leg in ("sql", "semantic"):
+        _s4 = preflight_both_leg(question, leg=both_leg)  # type: ignore[arg-type]
+    elif _s4 is None:
+        if both_nested:
+            _s4 = preflight_both_leg(question)
+        else:
+            _s4 = preflight_s4(question, schema_summary=SQL_Meta_Data)
     if _s4.handled and _s4.finish_response:
         return _finish_trace(_s4.finish_response, termination_reason="s4_both_preflight")
     if _s4.route and _s4.next_agent:
         from request_state import set_jev_route
 
         set_jev_route(_s4.route, _s4.next_agent)
+
+    def _wants_both_independent() -> bool:
+        from dual_route import infer_dual_route
+
+        if both_nested:
+            return False
+        if infer_dual_route(question) == "Both-independent":
+            return True
+        return bool(
+            _s4
+            and _s4.handled
+            and _s4.route
+            and str(_s4.route).startswith("Both")
+        )
+
+    if _wants_both_independent():
+        from both_answer import both_independent_answer
+        from jev_trace import event as _jev_event
+
+        _jev_event(
+            "S4",
+            decision="route",
+            choice="Both-independent",
+            skip_llm="both_parallel",
+        )
+        _both = both_independent_answer(question, parallel=True, parent_request_id=request_id)
+        return _finish_trace(_both, termination_reason="both_independent")
 
     try:
         from llm_telemetry import reset as _llm_telemetry_reset
@@ -2193,6 +2322,7 @@ def _get_final_answer_impl(question):
 
     with setup_step("azure_openai_refresh"):
         endpoint, client = refresh_azure_openai_runtime(llm_config)
+        sync_sql_generator_llm_from_shared()
 
     if AZURE_OPENAI_PROBE_BEFORE_CHAT:
         from azure_credential import probe_azure_openai_chat
@@ -2243,39 +2373,31 @@ def _get_final_answer_impl(question):
     import autogen
 
     # --- S2: OpenJev clarity gate (skips entire agent loop on vague queries) ---
-    if JEV_S2_CLARITY_ENABLED:
+    if JEV_S2_CLARITY_ENABLED and not both_nested:
         try:
             from jev_client import jev_clarity_check
             from jev_trace import jev_timed
 
             _clarity = jev_timed("S2", lambda: jev_clarity_check(question))
             if _clarity["source"] == "openjev" and _clarity["is_clear"] < 0.50:
-                _msg = (
-                    "Your question seems unclear or too vague for me to answer accurately. "
-                    "Could you please provide more details? "
-                    f"(Clarity score: {_clarity['is_clear']:.0%})"
+                from pipeline_exits import resolve_exit, trace_exit
+
+                trace_exit(
+                    "jev_s2_clarity_block",
+                    question=question,
+                    context={"clarity_score": _clarity.get("is_clear")},
                 )
-                response["llm_answer"] = _msg
-                response["Reasoning"] = "JEV S2: query below clarity threshold"
-                response["final_answer"] = {"query_answer": "", "llm_answer": _msg}
-                return _finish_trace(response)
+                response.update(
+                    resolve_exit(
+                        "jev_s2_clarity_block",
+                        question=question,
+                        context={"clarity_score": _clarity.get("is_clear")},
+                        base=response,
+                    )
+                )
+                return _finish_trace(response, termination_reason="jev_s2_clarity_block")
         except Exception as _e:  # noqa: BLE001
             import logging; logging.getLogger(__name__).warning("JEV S2 clarity check failed: %s", _e)
-
-    from dual_route import infer_dual_route
-
-    if infer_dual_route(question) == "Both-independent":
-        from both_answer import both_independent_answer
-        from jev_trace import event as _jev_event
-
-        _jev_event(
-            "S4",
-            decision="route",
-            choice="Both-independent",
-            skip_llm="both_parallel",
-        )
-        _both = both_independent_answer(question, parallel=True)
-        return _finish_trace(_both, termination_reason="both_independent")
 
     # --- S3: fallback if parallel cache arm timed out ---
     if JEV_S3_CACHE_ENABLED and not _pre.cache_scan_complete:
@@ -2285,6 +2407,10 @@ def _get_final_answer_impl(question):
             try:
                 _cm = jev_cache_intent_match(question, _cq)
                 if _cm["source"] == "openjev" and _cm.get("is_match", 0.0) > 0.85:
+                    from jev_s3_cache_version import cache_entry_valid
+
+                    if not cache_entry_valid(_cr):
+                        continue
                     _cr_copy = dict(_cr)
                     _cr_copy["jev_cache_hit"] = True
                     return _finish_trace(_cr_copy, termination_reason="jev_s3_cache_hit")
@@ -2306,12 +2432,13 @@ def _get_final_answer_impl(question):
     from API_unified import ORCHESTRATOR
 
     if ORCHESTRATOR != "groupchat":
-        begin_chat_phase()
+        from jev_trace import get_trace_t0, merge_traces_into_response, peel_main_thread_trace
         from orchestrator import run_pipeline
         from request_state import jev_route_choice, jev_route_next_agent
 
         _route = _s4.route or jev_route_choice()
         _next = _s4.next_agent or jev_route_next_agent()
+        _trace_t0 = get_trace_t0()
         with chat_wall_step("orchestrator_pipeline"):
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 
@@ -2325,22 +2452,32 @@ def _get_final_answer_impl(question):
                     next_agent=_next,
                     finish=_finish_trace,
                     base_response=response,
+                    trace_t0=_trace_t0,
                 )
 
             _pipe_pool = ThreadPoolExecutor(max_workers=1)
             _pipe_fut = _pipe_pool.submit(_run_pipeline)
             try:
                 response = _pipe_fut.result(timeout=_pipe_deadline_s)
+                response = merge_traces_into_response(response, peel_main_thread_trace())
             except FuturesTimeout:
                 _pipe_fut.cancel()
                 _pipe_pool.shutdown(wait=False, cancel_futures=True)
-                msg = (
-                    f"Request exceeded REQUEST_TIMEOUT_S ({REQUEST_TIMEOUT_S}s). "
-                    "Check DB retry loop, LLM latency, or JEV queue."
+                from pipeline_exits import resolve_exit, trace_exit
+
+                trace_exit(
+                    "request_timeout",
+                    question=question,
+                    context={"timeout_s": REQUEST_TIMEOUT_S},
                 )
-                response["llm_answer"] = msg
-                response["Reasoning"] = "request_timeout"
-                response["final_answer"] = {"query_answer": "", "llm_answer": msg}
+                response.update(
+                    resolve_exit(
+                        "request_timeout",
+                        question=question,
+                        context={"timeout_s": REQUEST_TIMEOUT_S},
+                        base=response,
+                    )
+                )
                 return _finish_trace(response, termination_reason="request_timeout")
             finally:
                 if not _pipe_pool._shutdown:  # noqa: SLF001
@@ -2360,7 +2497,9 @@ def _get_final_answer_impl(question):
         if JEV_S3_CACHE_ENABLED and question and not response.get("jev_cache_hit"):
             if len(_answer_cache) >= _CACHE_MAX:
                 _answer_cache.pop(next(iter(_answer_cache)), None)
-            _answer_cache[question] = dict(response)
+            from jev_s3_cache_version import stamp_cache_entry
+
+            _answer_cache[question] = stamp_cache_entry(dict(response))
         if JEV_S14_OUTPUT_GUARD_ENABLED:
             try:
                 from jev_client import jev_output_guard
@@ -2410,13 +2549,21 @@ def _get_final_answer_impl(question):
         from concurrent.futures import TimeoutError as FuturesTimeout
 
         if isinstance(chat_exc, FuturesTimeout):
-            msg = (
-                f"Request exceeded REQUEST_TIMEOUT_S ({REQUEST_TIMEOUT_S}s). "
-                "Check DB retry loop or LLM latency."
+            from pipeline_exits import resolve_exit, trace_exit
+
+            trace_exit(
+                "request_timeout",
+                question=question,
+                context={"timeout_s": REQUEST_TIMEOUT_S},
             )
-            response["llm_answer"] = msg
-            response["Reasoning"] = "request_timeout"
-            response["final_answer"] = {"query_answer": "", "llm_answer": msg}
+            response.update(
+                resolve_exit(
+                    "request_timeout",
+                    question=question,
+                    context={"timeout_s": REQUEST_TIMEOUT_S},
+                    base=response,
+                )
+            )
             return _finish_trace(response, termination_reason="request_timeout")
         msg = str(chat_exc)
         if (
@@ -2602,7 +2749,9 @@ def _get_final_answer_impl(question):
         if len(_answer_cache) >= _CACHE_MAX:
             # Evict oldest entry (FIFO)
             _answer_cache.pop(next(iter(_answer_cache)), None)
-        _answer_cache[question] = dict(response)
+        from jev_s3_cache_version import stamp_cache_entry
+
+        _answer_cache[question] = stamp_cache_entry(dict(response))
 
     # --- S14: OpenJev output PII / data-leak guard (+0.08s, blocks sensitive leaks) ---
     if JEV_S14_OUTPUT_GUARD_ENABLED:
