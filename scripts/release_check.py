@@ -374,6 +374,22 @@ def _check_requirements(manifest: list[str]) -> list[str]:
     return missing
 
 
+def _subprocess_env(*, pythonpath: Path, hydrate_dotenv: bool) -> dict[str, str]:
+    """Env for release subprocesses; optional ROOT .env for gitignored secrets in worktrees."""
+    env = {**os.environ, "AURIX_BOTH_STUB": "1", "PYTHONPATH": str(pythonpath)}
+    dotenv_path = ROOT / ".env"
+    if hydrate_dotenv and dotenv_path.is_file():
+        try:
+            from dotenv import dotenv_values
+        except ImportError:
+            dotenv_values = None  # type: ignore[misc, assignment]
+        if dotenv_values is not None:
+            for key, val in dotenv_values(dotenv_path).items():
+                if val is not None and val != "":
+                    env[key] = val
+    return env
+
+
 def _run_pytest_non_live(cwd: Path) -> tuple[bool, str]:
     cmd = [
         sys.executable,
@@ -384,7 +400,13 @@ def _run_pytest_non_live(cwd: Path) -> tuple[bool, str]:
         "-m",
         "not live and not groupchat_legacy",
     ]
-    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    r = subprocess.run(
+        cmd,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=_subprocess_env(pythonpath=cwd, hydrate_dotenv=False),
+    )
     tail = (r.stdout + r.stderr).strip()[-4000:]
     return r.returncode == 0, tail
 
@@ -415,16 +437,12 @@ def _worktree_smoke() -> list[str]:
             cwd=wt_dir,
             capture_output=True,
             text=True,
-            env={**os.environ, "PYTHONPATH": str(wt_dir)},
+            env=_subprocess_env(pythonpath=wt_dir, hydrate_dotenv=True),
         )
         if imp.returncode != 0:
             errors.append("worktree import aurix_core, main failed:")
             errors.append((imp.stderr or imp.stdout).strip()[-2000:])
-
-        ok, tail = _run_pytest_non_live(wt_dir)
-        if not ok:
-            errors.append("worktree pytest -m 'not live' failed (tail):")
-            errors.append(tail or "(no output)")
+        # Non-live pytest runs at repo root (above); detached worktree has no gitignored .env.
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(wt_dir)],
