@@ -6,6 +6,7 @@ from both_answer import both_independent_answer
 
 def test_both_legs_use_parent_request_id(monkeypatch):
     monkeypatch.delenv("AURIX_BOTH_STUB", raising=False)
+    monkeypatch.setattr("API_unified.MERGE_NODE_ENABLED", False, raising=False)
     legs: list[tuple[str, str]] = []
 
     def _sql(question: str, *, parent_request_id: str) -> dict:
