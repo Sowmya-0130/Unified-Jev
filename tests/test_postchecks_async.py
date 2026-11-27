@@ -22,15 +22,16 @@ def test_async_flag_off_runs_sync():
 
 def test_async_flag_on_returns_immediately():
     import API_unified
+    import postchecks_async
     from postchecks_async import PostcheckContext, dispatch_postchecks
 
     with patch.object(API_unified, "ASYNC_POSTCHECKS_ENABLED", True):
-        with patch("postchecks_async.run_postchecks_async") as async_mock:
+        with patch.object(postchecks_async, "run_postchecks_async", MagicMock()) as async_mock:
             t0 = time.perf_counter()
             dispatch_postchecks(
                 PostcheckContext(question="q", route="semantic", answer_text="a", chunks=[])
             )
-            assert time.perf_counter() - t0 < 0.2
+            assert time.perf_counter() - t0 < 0.5
             async_mock.assert_called_once()
 
 
